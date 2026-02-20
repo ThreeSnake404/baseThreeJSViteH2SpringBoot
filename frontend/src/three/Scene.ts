@@ -46,6 +46,10 @@ export class Scene {
   private buggyModel: THREE.Object3D | null = null;
   private readonly buggyStartPosition = new THREE.Vector3();
   private readonly buggyForward = new THREE.Vector3();
+  /** Initial buggy quaternion (wheels on ground, front away from dome). Route heading = world Z rotation * this. */
+  private readonly buggyInitialQuat = new THREE.Quaternion();
+  private readonly buggyZRotQuat = new THREE.Quaternion();
+  private readonly worldZAxis = new THREE.Vector3(0, 0, 1);
   private buggyLength = 0;
   private buggyAnimationPlaying = false;
   private buggyAnimationTime = 0;
@@ -54,10 +58,43 @@ export class Scene {
   /** Fixed zoom levels: High = full map, Medium = 1/4 map, Low = 1/16 map. No wheel zoom. */
   private zoomLevel: 'high' | 'medium' | 'low' = 'high';
   private readonly zoomDistances = { high: 2.2, medium: 2.2 / 2, low: 2.2 / 4 };
+  /** Route mode: green circle under buggy, waypoints, dynamic line, destinations (green domes). */
+  private routeMode = false;
+  private buggySelected = false;
+  private readonly routeWaypoints: { x: number; y: number }[] = [];
+  private buggyCircle: THREE.Mesh | null = null;
+  private readonly waypointMeshes: THREE.Mesh[] = [];
+  private dynamicLine: THREE.Line | null = null;
+  private readonly destinationCircles: THREE.Mesh[] = [];
+  /** Green dome destinations: center (x,y) and dome radius. Circle radius = domeRadius + buggyLength when drawing. */
+  private destinations: { x: number; y: number; domeRadius: number }[] = [];
+  /** Debug: red spheres on top of each detected green dome (to verify detection). */
+  private readonly debugDomeSpheres: THREE.Mesh[] = [];
+  private readonly mapPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+  private readonly mapPlaneIntersect = new THREE.Vector3();
+  private surfaceZ = 0;
+  private boundOnPointerMove: (e: PointerEvent) => void;
+  private boundOnPointerUp: (e: PointerEvent) => void;
+  private boundOnContextMenu: (e: PointerEvent) => void;
+  private onRouteModeChange?: (active: boolean) => void;
+  /** Right mouse down in route mode: store target to detect pan. Terminate route only on right release if map was not panned. */
+  private routeRightDown = false;
+  private readonly routeRightDownTarget = new THREE.Vector3();
+  private static readonly ROUTE_PAN_EPSILON = 1e-5;
+  /** Route: buggy moving toward waypoints; start/end position and progress. */
+  private routeMoveStart = new THREE.Vector3();
+  private routeMoveEnd = new THREE.Vector3();
+  private routeMoveDuration = 0;
+  private routeMoveElapsed = 0;
+  private readonly routeMoveSpeed = 6; // buggy lengths per second (max)
+  /** Last mouse position on map plane (for dynamic route line when buggySelected). */
+  private readonly lastMouseWorldOnMap = new THREE.Vector3();
+  private static readonly MAX_ROUTE_LINE_POINTS = 64;
 
-  constructor(canvas: HTMLCanvasElement, onColorChange?: OnColorChange) {
+  constructor(canvas: HTMLCanvasElement, onColorChange?: OnColorChange, onRouteModeChange?: (active: boolean) => void) {
     this.canvas = canvas;
     this.onColorChange = onColorChange;
+    this.onRouteModeChange = onRouteModeChange;
     this.renderer = createRenderer(canvas);
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(
@@ -114,6 +151,9 @@ export class Scene {
     this.scene.add(zLabel);
 
     this.boundOnPointerDown = this.onPointerDown.bind(this);
+    this.boundOnPointerMove = this.onPointerMove.bind(this);
+    this.boundOnPointerUp = this.onPointerUp.bind(this);
+    this.boundOnContextMenu = this.onContextMenu.bind(this);
   }
 
   /** Create a sprite with a single letter for axis labeling (always faces camera). */
@@ -235,13 +275,74 @@ export class Scene {
             topZ: domeBox.max.z,
             groundZ: domeBox.min.z, // where dome meets ground (blue flat surface)
           };
-          const topmost = new THREE.Vector3(whiteDomeSurface.centerX, whiteDomeSurface.centerY, whiteDomeSurface.topZ);
-          const sphereGeom = new THREE.SphereGeometry(0.03, 16, 12);
-          const sphereMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
-          const redSphere = new THREE.Mesh(sphereGeom, sphereMat);
-          redSphere.position.copy(topmost);
-          this.scene.add(redSphere);
+          // White dome: parking garage; top at (centerX, centerY, topZ), base at groundZ (no red sphere marker)
         }
+        this.destinations = [];
+        const addDomeDestination = (mesh: THREE.Mesh, box: THREE.Box3, domeRadius: number) => {
+          box.getCenter(center);
+          this.destinations.push({ x: center.x, y: center.y, domeRadius });
+          const sphereGeom = new THREE.SphereGeometry(Math.max(domeRadius * 0.15, 0.02), 16, 12);
+          const sphereMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+          const sphere = new THREE.Mesh(sphereGeom, sphereMat);
+          sphere.position.set(center.x, center.y, box.max.z + 0.02);
+          this.scene.add(sphere);
+          this.debugDomeSpheres.push(sphere);
+        };
+        model.traverse((child) => {
+          if (child instanceof THREE.Mesh && child.material) {
+            const mat = Array.isArray(child.material) ? child.material[0] : child.material;
+            const meshBox = new THREE.Box3().setFromObject(child);
+            meshBox.getSize(sizeVec);
+            const maxSize = Math.max(sizeVec.x, sizeVec.y, sizeVec.z);
+            const minSize = Math.min(sizeVec.x, sizeVec.y, sizeVec.z);
+            const isDomeLike = minSize > maxSize * 0.3;
+            if (!isDomeLike) return;
+            if (child === whiteDomeMesh) return;
+            let isGreen = false;
+            if (mat && 'color' in mat && mat.color) {
+              const c = (mat as THREE.MeshStandardMaterial).color;
+              const greenness = c.g - (c.r + c.b) / 2;
+              isGreen = greenness > 0.15;
+            }
+            const name = (child.name || '').toLowerCase();
+            if (!isGreen && (name.includes('green') || name.includes('dome'))) isGreen = true;
+            if (isGreen) {
+              const domeRadius = maxSize / 2;
+              addDomeDestination(child, meshBox, domeRadius);
+            }
+          }
+        });
+        if (this.destinations.length < 5) {
+          this.destinations = [];
+          this.debugDomeSpheres.forEach((s) => {
+            this.scene.remove(s);
+            s.geometry.dispose();
+            (s.material as THREE.Material).dispose();
+          });
+          this.debugDomeSpheres.length = 0;
+          model.traverse((child) => {
+            if (child instanceof THREE.Mesh && child.material && child !== whiteDomeMesh) {
+              const meshBox = new THREE.Box3().setFromObject(child);
+              meshBox.getSize(sizeVec);
+              const maxSize = Math.max(sizeVec.x, sizeVec.y, sizeVec.z);
+              const minSize = Math.min(sizeVec.x, sizeVec.y, sizeVec.z);
+              const isDomeLike = minSize > maxSize * 0.3;
+              if (!isDomeLike) return;
+              const mat = Array.isArray(child.material) ? child.material[0] : child.material;
+              let isWhite = false;
+              if (mat && 'color' in mat && mat.color) {
+                const c = (mat as THREE.MeshStandardMaterial).color;
+                const L = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+                if (L > 0.7) isWhite = true;
+              }
+              if (!isWhite) {
+                const domeRadius = maxSize / 2;
+                addDomeDestination(child, meshBox, domeRadius);
+              }
+            }
+          });
+        }
+        console.log('[Scene] Green dome destinations found:', this.destinations.length, '(expected 5). Positions:', this.destinations.map((d) => ({ x: d.x.toFixed(3), y: d.y.toFixed(3), r: d.domeRadius.toFixed(3) })));
         if (opts?.singleBuggyUrl) this.loadSingleBuggy(opts.singleBuggyUrl, this.whiteDomeSize ?? undefined, whiteDomeSurface);
       },
       undefined,
@@ -262,6 +363,7 @@ export class Scene {
       (gltf) => {
         if (this.disposed) return;
         const model = gltf.scene;
+        // Original orientation: wheels on ground, front pointing away from white dome base. Only rotation during route is around Z (map normal toward viewport).
         model.rotation.x = -Math.PI / 2;
         model.rotation.y = Math.PI;
         model.rotation.z = Math.PI;
@@ -287,8 +389,9 @@ export class Scene {
         }
         model.updateMatrixWorld(true);
         this.buggyModel = model;
+        this.buggyInitialQuat.copy(model.quaternion);
         this.buggyStartPosition.copy(model.position);
-        // Forward = back-to-front (capsule to batteries): use model's +X in world, not +Z (which was "to the right of forward")
+        // Forward = back-to-front (capsule to batteries): use model's +X in world
         this.buggyForward.set(1, 0, 0).applyQuaternion(model.quaternion);
         this.buggyForward.z = 0;
         if (this.buggyForward.lengthSq() < 1e-6) this.buggyForward.set(1, 0, 0);
@@ -306,12 +409,93 @@ export class Scene {
     return t * t * (3 - 2 * t);
   }
 
+  private getMouseWorldOnMap(out: THREE.Vector3): boolean {
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    this.raycaster.ray.intersectPlane(this.mapPlane, out);
+    return true;
+  }
+
+  private onPointerMove(event: PointerEvent): void {
+    if (!this.routeMode || this.disposed) return;
+    const rect = this.canvas.getBoundingClientRect();
+    this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    if (!this.buggySelected) return;
+    this.getMouseWorldOnMap(this.mapPlaneIntersect);
+    this.lastMouseWorldOnMap.copy(this.mapPlaneIntersect);
+  }
+
+  private onContextMenu(event: PointerEvent): void {
+    if (this.routeMode) event.preventDefault();
+  }
+
+  private onPointerUp(event: PointerEvent): void {
+    if (!this.routeMode || this.disposed || event.button !== 2) return;
+    if (!this.routeRightDown) return;
+    this.routeRightDown = false;
+    const target = this.controls?.target;
+    if (!target) return;
+    const dx = target.x - this.routeRightDownTarget.x;
+    const dy = target.y - this.routeRightDownTarget.y;
+    const panned = dx * dx + dy * dy > Scene.ROUTE_PAN_EPSILON * Scene.ROUTE_PAN_EPSILON;
+    if (!panned) this.setRouteMode(false);
+  }
+
+  private hitDestination(x: number, y: number): boolean {
+    if (this.buggyLength <= 0) return false;
+    for (const d of this.destinations) {
+      const radius = d.domeRadius + this.buggyLength;
+      const dx = x - d.x, dy = y - d.y;
+      if (dx * dx + dy * dy <= radius * radius) return true;
+    }
+    return false;
+  }
+
   private onPointerDown(event: PointerEvent): void {
     if (this.disposed) return;
     const rect = this.canvas.getBoundingClientRect();
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.pointer, this.camera);
+    if (this.routeMode) {
+      if (event.button === 2) {
+        this.routeRightDown = true;
+        if (this.controls?.target) this.routeRightDownTarget.copy(this.controls.target);
+        return;
+      }
+      this.getMouseWorldOnMap(this.mapPlaneIntersect);
+      const wx = this.mapPlaneIntersect.x, wy = this.mapPlaneIntersect.y;
+      if (this.hitDestination(wx, wy)) {
+        this.setRouteMode(false);
+        return;
+      }
+      const hitBuggy = this.buggyModel && this.raycaster.intersectObject(this.buggyModel, true).length > 0;
+      const hitBuggyCircle = this.buggyCircle && this.raycaster.intersectObject(this.buggyCircle, false).length > 0;
+      if (hitBuggy || hitBuggyCircle) {
+        this.buggySelected = true;
+        if (this.buggyModel) {
+          this.lastMouseWorldOnMap.set(this.buggyModel.position.x, this.buggyModel.position.y, this.surfaceZ);
+        }
+        if (this.buggyCircle && this.buggyCircle.material instanceof THREE.MeshBasicMaterial) {
+          this.buggyCircle.material.color.setHex(0xffd700);
+        }
+        if (this.dynamicLine) this.dynamicLine.visible = true;
+        return;
+      }
+      if (this.buggySelected) {
+        this.routeWaypoints.push({ x: wx, y: wy });
+        const circleGeom = new THREE.CircleGeometry(this.buggyLength * 0.5, 24);
+        const circleMat = new THREE.MeshBasicMaterial({ color: 0xffd700, depthWrite: false, transparent: true, opacity: 0.5 });
+        const wpMesh = new THREE.Mesh(circleGeom, circleMat);
+        wpMesh.position.set(wx, wy, this.surfaceZ);
+        this.scene.add(wpMesh);
+        this.waypointMeshes.push(wpMesh);
+        if (this.routeWaypoints.length === 1 && !this.routeMoveDuration) {
+          this.startRouteMoveToNext();
+        }
+      }
+      return;
+    }
     const hits = this.raycaster.intersectObject(this.cubeMesh, false);
     if (hits.length === 0) return;
     const currentName = CUBE_COLORS[this.colorIndex].name;
@@ -321,6 +505,16 @@ export class Scene {
     const mat = this.cubeMesh.material as THREE.MeshStandardMaterial;
     mat.color.setHex(nextHex);
     this.onColorChange?.(currentName, nextName);
+  }
+
+  private startRouteMoveToNext(): void {
+    if (!this.buggyModel || this.routeWaypoints.length === 0) return;
+    this.routeMoveStart.copy(this.buggyModel.position);
+    const wp = this.routeWaypoints[0];
+    this.routeMoveEnd.set(wp.x, wp.y, this.buggyModel.position.z);
+    const dist = this.routeMoveStart.distanceTo(this.routeMoveEnd);
+    this.routeMoveDuration = dist / (this.buggyLength * this.routeMoveSpeed);
+    this.routeMoveElapsed = 0;
   }
 
   /**
@@ -407,7 +601,134 @@ export class Scene {
   }
 
   /**
+   * Enter or exit Route mode. When entering: green circle under buggy, destination circles. When exiting: remove route visuals, clear waypoints.
+   */
+  setRouteMode(active: boolean): void {
+    if (this.routeMode === active) return;
+    this.routeMode = active;
+    this.onRouteModeChange?.(active);
+    if (active) {
+      this.buggySelected = false;
+      this.routeWaypoints.length = 0;
+      this.routeRightDown = false;
+      this.createRouteVisuals();
+      this.canvas.addEventListener('pointermove', this.boundOnPointerMove);
+      this.canvas.addEventListener('pointerup', this.boundOnPointerUp);
+      window.addEventListener('pointerup', this.boundOnPointerUp);
+      this.canvas.addEventListener('contextmenu', this.boundOnContextMenu);
+    } else {
+      this.canvas.removeEventListener('pointermove', this.boundOnPointerMove);
+      this.canvas.removeEventListener('pointerup', this.boundOnPointerUp);
+      window.removeEventListener('pointerup', this.boundOnPointerUp);
+      this.canvas.removeEventListener('contextmenu', this.boundOnContextMenu);
+      this.removeRouteVisuals();
+      this.buggySelected = false;
+      this.routeWaypoints.length = 0;
+      this.routeMoveDuration = 0;
+    }
+  }
+
+  private createRouteVisuals(): void {
+    if (!this.buggyModel || this.buggyLength <= 0) return;
+    this.surfaceZ = 0.001;
+    const circleGeom = new THREE.CircleGeometry(this.buggyLength, 32);
+    const circleMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, depthWrite: false, transparent: true, opacity: 0.5 });
+    this.buggyCircle = new THREE.Mesh(circleGeom, circleMat);
+    // CircleGeometry lies in XY plane by default; keep it parallel to the map (no rotation)
+    this.updateBuggyCirclePosition();
+    this.scene.add(this.buggyCircle);
+    const lineGeom = new THREE.BufferGeometry();
+    const linePositions = new Float32Array(Scene.MAX_ROUTE_LINE_POINTS * 3);
+    lineGeom.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
+    lineGeom.setDrawRange(0, 0);
+    this.dynamicLine = new THREE.Line(lineGeom, new THREE.LineBasicMaterial({ color: 0xffd700 }));
+    this.dynamicLine.visible = false;
+    this.scene.add(this.dynamicLine);
+    const destZ = this.surfaceZ + 0.004;
+    for (const d of this.destinations) {
+      const radius = d.domeRadius + this.buggyLength;
+      const geom = new THREE.CircleGeometry(radius, 32);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x00aa00,
+        depthWrite: false,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.5,
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.set(d.x, d.y, destZ);
+      mesh.renderOrder = 1;
+      this.scene.add(mesh);
+      this.destinationCircles.push(mesh);
+    }
+  }
+
+  private removeRouteVisuals(): void {
+    if (this.buggyCircle) {
+      this.scene.remove(this.buggyCircle);
+      this.buggyCircle.geometry.dispose();
+      (this.buggyCircle.material as THREE.Material).dispose();
+      this.buggyCircle = null;
+    }
+    for (const m of this.waypointMeshes) {
+      this.scene.remove(m);
+      m.geometry.dispose();
+      (m.material as THREE.Material).dispose();
+    }
+    this.waypointMeshes.length = 0;
+    if (this.dynamicLine) {
+      this.scene.remove(this.dynamicLine);
+      this.dynamicLine.geometry.dispose();
+      (this.dynamicLine.material as THREE.Material).dispose();
+      this.dynamicLine = null;
+    }
+    for (const m of this.destinationCircles) {
+      this.scene.remove(m);
+      m.geometry.dispose();
+      (m.material as THREE.Material).dispose();
+    }
+    this.destinationCircles.length = 0;
+  }
+
+  private updateBuggyCirclePosition(): void {
+    if (!this.buggyCircle || !this.buggyModel) return;
+    this.buggyCircle.position.set(this.buggyModel.position.x, this.buggyModel.position.y, this.surfaceZ);
+  }
+
+  /**
+   * Update the route polyline: buggy position -> waypoints -> (mouse if buggySelected).
+   * Called every frame so the line from buggy to current target and between waypoints is continuous.
+   */
+  private updateDynamicRouteLine(): void {
+    if (!this.dynamicLine || !this.buggyModel) return;
+    const pos = this.dynamicLine.geometry.attributes.position as THREE.BufferAttribute;
+    const arr = pos.array as Float32Array;
+    let i = 0;
+    const bx = this.buggyModel.position.x, by = this.buggyModel.position.y;
+    arr[i * 3] = bx;
+    arr[i * 3 + 1] = by;
+    arr[i * 3 + 2] = this.surfaceZ;
+    i++;
+    for (const wp of this.routeWaypoints) {
+      if (i >= Scene.MAX_ROUTE_LINE_POINTS) break;
+      arr[i * 3] = wp.x;
+      arr[i * 3 + 1] = wp.y;
+      arr[i * 3 + 2] = this.surfaceZ;
+      i++;
+    }
+    if (this.buggySelected && i < Scene.MAX_ROUTE_LINE_POINTS) {
+      arr[i * 3] = this.lastMouseWorldOnMap.x;
+      arr[i * 3 + 1] = this.lastMouseWorldOnMap.y;
+      arr[i * 3 + 2] = this.surfaceZ;
+      i++;
+    }
+    pos.needsUpdate = true;
+    this.dynamicLine.geometry.setDrawRange(0, Math.max(0, i));
+  }
+
+  /**
    * Set fixed zoom level (no wheel zoom). High = full map, Medium = 1/4 map, Low = 1/16 map.
+   * Does not exit or affect Route mode.
    */
   setZoomLevel(level: 'high' | 'medium' | 'low'): void {
     this.zoomLevel = level;
@@ -473,7 +794,8 @@ export class Scene {
         }
         this.chompMixer.update(delta);
       }
-      if (this.buggyModel && this.buggyLength > 0 && this.buggyAnimationPlaying) {
+      const routeMoving = this.routeMode && this.routeWaypoints.length > 0 && this.routeMoveDuration > 0;
+      if (this.buggyModel && this.buggyLength > 0 && this.buggyAnimationPlaying && !routeMoving) {
         this.buggyAnimationTime += delta;
         const cycleSec = 12; // 6s forward + 6s back (half of previous speed)
         const t = this.buggyAnimationTime % cycleSec;
@@ -491,6 +813,38 @@ export class Scene {
           this.buggyModel.position.copy(this.buggyStartPosition).addScaledVector(this.buggyForward, totalDist - offset);
         }
       }
+      if (this.routeMode && this.buggyModel && this.routeMoveDuration > 0) {
+        this.routeMoveElapsed += delta;
+        const t = Math.min(1, this.routeMoveElapsed / this.routeMoveDuration);
+        const eased = Scene.easeInOut(t);
+        this.buggyModel.position.lerpVectors(this.routeMoveStart, this.routeMoveEnd, eased);
+        const dx = this.routeMoveEnd.x - this.buggyModel.position.x;
+        const dy = this.routeMoveEnd.y - this.buggyModel.position.y;
+        if (dx * dx + dy * dy > 1e-10) {
+          const targetAngle = Math.atan2(dy, dx);
+          const initialForwardAngle = Math.atan2(this.buggyForward.y, this.buggyForward.x);
+          const angle = targetAngle - initialForwardAngle;
+          this.buggyZRotQuat.setFromAxisAngle(this.worldZAxis, angle);
+          this.buggyModel.quaternion.copy(this.buggyInitialQuat).premultiply(this.buggyZRotQuat);
+        }
+        this.updateBuggyCirclePosition();
+        if (t >= 1) {
+          this.routeWaypoints.shift();
+          const firstMesh = this.waypointMeshes.shift();
+          if (firstMesh) {
+            this.scene.remove(firstMesh);
+            firstMesh.geometry.dispose();
+            (firstMesh.material as THREE.Material).dispose();
+          }
+          this.routeMoveDuration = 0;
+          if (this.routeWaypoints.length > 0) this.startRouteMoveToNext();
+        }
+      } else if (this.routeMode) {
+        this.updateBuggyCirclePosition();
+      }
+      if (this.routeMode && this.dynamicLine && (this.buggySelected || this.routeWaypoints.length > 0)) {
+        this.updateDynamicRouteLine();
+      }
       this.renderer.render(this.scene, this.camera);
     };
     loop();
@@ -499,11 +853,24 @@ export class Scene {
   dispose(): void {
     this.disposed = true;
     this.canvas.removeEventListener('pointerdown', this.boundOnPointerDown);
+    if (this.routeMode) {
+      this.canvas.removeEventListener('pointermove', this.boundOnPointerMove);
+      this.canvas.removeEventListener('pointerup', this.boundOnPointerUp);
+      window.removeEventListener('pointerup', this.boundOnPointerUp);
+      this.canvas.removeEventListener('contextmenu', this.boundOnContextMenu);
+      this.removeRouteVisuals();
+    }
     if (this.rafId != null) cancelAnimationFrame(this.rafId);
     this.rafId = null;
     this.controls?.dispose();
     this.controls = null;
     this.resizeDispose?.();
+    for (const sphere of this.debugDomeSpheres) {
+      this.scene.remove(sphere);
+      sphere.geometry.dispose();
+      (sphere.material as THREE.Material).dispose();
+    }
+    this.debugDomeSpheres.length = 0;
     this.scene.traverse((obj) => {
       if (obj instanceof THREE.Mesh) {
         obj.geometry?.dispose();

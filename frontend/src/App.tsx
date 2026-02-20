@@ -22,6 +22,7 @@ function App() {
   const sceneRef = useRef<Scene | null>(null);
   const guidRef = useRef<string>(generateGuid());
   const [wsStatus, setWsStatus] = useState<'closed' | 'open'>('closed');
+  const [routeMode, setRouteMode] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
   const onColorChange = useCallback((currentColor: string, nextColor: string) => {
@@ -38,9 +39,11 @@ function App() {
     }
   }, []);
 
+  const onRouteModeChange = useCallback((active: boolean) => setRouteMode(active), []);
+
   useEffect(() => {
     if (!canvasRef.current) return;
-    const scene = new Scene(canvasRef.current, onColorChange);
+    const scene = new Scene(canvasRef.current, onColorChange, onRouteModeChange);
     sceneRef.current = scene;
     scene.start();
     // Defer model loads so first frame renders and UI stays responsive (GLB parse can block)
@@ -52,7 +55,7 @@ function App() {
       sceneRef.current = null;
       scene.dispose();
     };
-  }, [onColorChange]);
+  }, [onColorChange, onRouteModeChange]);
 
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -170,6 +173,17 @@ function App() {
           style={zoomButtonStyle}
         >
           Low
+        </button>
+        <button
+          type="button"
+          onClick={() => sceneRef.current?.setRouteMode(!routeMode)}
+          title="Route mode: click buggy, then place waypoints; right-click to set final waypoint or destination, or press Route again to exit"
+          style={{
+            ...zoomButtonStyle,
+            background: routeMode ? '#b8860b' : zoomButtonStyle.background,
+          }}
+        >
+          Route
         </button>
       </div>
       <button
