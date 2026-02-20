@@ -9,7 +9,9 @@ import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import com.example.poc.entity.Clicked;
+import com.example.poc.entity.ScreenClick;
 import com.example.poc.repository.ClickedRepository;
+import com.example.poc.repository.ScreenClickRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
@@ -20,10 +22,12 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
 
     private final CopyOnWriteArraySet<WebSocketSession> sessions = new CopyOnWriteArraySet<>();
     private final ClickedRepository clickedRepository;
+    private final ScreenClickRepository screenClickRepository;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public RawWebSocketHandler(ClickedRepository clickedRepository) {
+    public RawWebSocketHandler(ClickedRepository clickedRepository, ScreenClickRepository screenClickRepository) {
         this.clickedRepository = clickedRepository;
+        this.screenClickRepository = screenClickRepository;
     }
 
     @Override
@@ -45,6 +49,13 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
                 String nextColor = json.get("nextColor") != null ? json.get("nextColor").toString() : null;
                 if (guid != null && currentColor != null && nextColor != null) {
                     clickedRepository.save(new Clicked(currentColor, nextColor, guid));
+                }
+            } else if ("screenClick".equals(type)) {
+                String guid = json.get("guid") != null ? json.get("guid").toString() : null;
+                Number cx = json.get("clientX") instanceof Number ? (Number) json.get("clientX") : null;
+                Number cy = json.get("clientY") instanceof Number ? (Number) json.get("clientY") : null;
+                if (guid != null && cx != null && cy != null) {
+                    screenClickRepository.save(new ScreenClick(guid, cx.doubleValue(), cy.doubleValue()));
                 }
             }
         } catch (Exception e) {

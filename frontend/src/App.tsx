@@ -3,6 +3,9 @@ import { Scene } from './three/Scene';
 
 const API_BASE = '';
 
+const shinyPathGlbUrl = new URL('./models/ShinyPath_01.glb', import.meta.url).href;
+const singleBuggyGlbUrl = new URL('./models/SingleBuggy_02.glb', import.meta.url).href;
+
 function generateGuid(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID();
@@ -16,6 +19,7 @@ function generateGuid(): string {
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const sceneRef = useRef<Scene | null>(null);
   const guidRef = useRef<string>(generateGuid());
   const [wsStatus, setWsStatus] = useState<'closed' | 'open'>('closed');
   const wsRef = useRef<WebSocket | null>(null);
@@ -37,8 +41,17 @@ function App() {
   useEffect(() => {
     if (!canvasRef.current) return;
     const scene = new Scene(canvasRef.current, onColorChange);
+    sceneRef.current = scene;
     scene.start();
-    return () => scene.dispose();
+    // Defer model loads so first frame renders and UI stays responsive (GLB parse can block)
+    const loadId = requestAnimationFrame(() => {
+      sceneRef.current?.loadShinyPath(shinyPathGlbUrl, { singleBuggyUrl: singleBuggyGlbUrl });
+    });
+    return () => {
+      cancelAnimationFrame(loadId);
+      sceneRef.current = null;
+      scene.dispose();
+    };
   }, [onColorChange]);
 
   useEffect(() => {
@@ -82,6 +95,18 @@ function App() {
     window.open(`${window.location.origin}${API_BASE}/h2-console`, '_blank');
   };
 
+  const zoomButtonStyle: React.CSSProperties = {
+    padding: '6px 12px',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+    border: '1px solid #444',
+    borderRadius: 6,
+    background: '#2a2a2a',
+    color: '#eee',
+    boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+  };
+
   return (
     <>
       <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
@@ -90,13 +115,85 @@ function App() {
           position: 'absolute',
           top: 12,
           left: 12,
+          zIndex: 10,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
           color: '#fff',
           textShadow: '0 0 4px #000',
           fontSize: 14,
         }}
       >
-        WebSocket: {wsStatus}
+        <span
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: '50%',
+            background: wsStatus === 'open' ? '#0c0' : '#c00',
+            flexShrink: 0,
+          }}
+          title={`WebSocket: ${wsStatus}`}
+        />
+        <span>WebSocket: {wsStatus}</span>
       </div>
+      <div
+        style={{
+          position: 'absolute',
+          top: 44,
+          left: 12,
+          zIndex: 10,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => sceneRef.current?.setZoomLevel('high')}
+          title="High altitude – full map in viewport"
+          style={zoomButtonStyle}
+        >
+          High
+        </button>
+        <button
+          type="button"
+          onClick={() => sceneRef.current?.setZoomLevel('medium')}
+          title="Medium – one quarter of map"
+          style={zoomButtonStyle}
+        >
+          Medium
+        </button>
+        <button
+          type="button"
+          onClick={() => sceneRef.current?.setZoomLevel('low')}
+          title="Low – one sixteenth of map"
+          style={zoomButtonStyle}
+        >
+          Low
+        </button>
+      </div>
+      <button
+        type="button"
+        onClick={() => sceneRef.current?.toggleBuggyAnimation()}
+        title="Toggle buggy animation (play / pause)"
+        style={{
+          position: 'absolute',
+          bottom: 52,
+          right: 16,
+          zIndex: 10,
+          padding: '8px 14px',
+          fontSize: 14,
+          fontWeight: 600,
+          cursor: 'pointer',
+          border: '1px solid #444',
+          borderRadius: 6,
+          background: '#2a2a2a',
+          color: '#eee',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+        }}
+      >
+        Animate
+      </button>
       <button
         type="button"
         onClick={openH2Console}
@@ -105,6 +202,7 @@ function App() {
           position: 'absolute',
           bottom: 16,
           right: 16,
+          zIndex: 10,
           padding: '8px 14px',
           fontSize: 14,
           fontWeight: 600,

@@ -7,5 +7,7 @@ export function createRenderer(canvas: HTMLCanvasElement): THREE.WebGLRenderer {
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1;
+  renderer.shadowMap.enabled = false; // re-enable when scene is lighter to avoid freeze
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   return renderer;
 }
