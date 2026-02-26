@@ -1,0 +1,15 @@
+---
+description: STS command — when user types STS, add all, commit with auto message, push
+alwaysApply: true
+---
+
+# STS command (this project)
+
+When the user types **STS** in capital letters (and nothing else, or as a standalone request), treat it as the "STS" command for this project. You must:
+
+1. **Add all** — Run `git add -A` to stage all new, modified, and deleted files.
+2. **Inspect changes** — Run `git status` and `git diff --stat HEAD` (and if needed `git diff HEAD` or `git log -1 --stat`) to see what changed since the last commit.
+3. **Commit with a meaningful message** — Create a single commit with a short summary line and optional bullet points that accurately describe the changes (new features, fixes, refactors, etc.). Use `git commit -m "..."`.
+4. **Push** — Run `git push` to push to the remote (e.g. `origin`).
+
+Do not ask for confirmation or for the user to type the commit message. Generate the commit message yourself from the changes. If there is nothing to commit, say so and do not push. If push fails (e.g. auth or conflict), report the error and stop.
