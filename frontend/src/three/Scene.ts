@@ -41,12 +41,32 @@ export type SelectedObjectInfo = {
   sz: number;
 } | null;
 
+export type CameraInfo = {
+  position: { x: number; y: number; z: number };
+  target: { x: number; y: number; z: number };
+  projection: 'Perspective' | 'Orthographic';
+  fov: number;
+  near: number;
+  far: number;
+};
+
+export type CameraParams = {
+  position?: [number, number, number];
+  target?: [number, number, number];
+  fov?: number;
+  near?: number;
+  far?: number;
+  projection?: 'Perspective' | 'Orthographic';
+};
+
 export type PlacementFacilityOptions = {
   getPFEnabled: () => boolean;
   onSelectionChange: (info: SelectedObjectInfo) => void;
+  onCameraChange?: (info: CameraInfo) => void;
   setPositionRef?: { current: ((x: number, y: number, z: number) => void) | null };
   setRotationRef?: { current: ((rx: number, ry: number, rz: number) => void) | null };
   setScaleRef?: { current: ((sx: number, sy: number, sz: number) => void) | null };
+  setCameraRef?: { current: ((params: CameraParams) => void) | null };
 };
 
 /**
@@ -57,7 +77,7 @@ export class Scene {
   private readonly canvas: HTMLCanvasElement;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
-  private readonly camera: THREE.PerspectiveCamera;
+  private camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
   private readonly clock: THREE.Clock;
   private readonly cubeMesh: THREE.Mesh;
   private readonly markerSphere: THREE.Mesh;
@@ -103,6 +123,7 @@ export class Scene {
   private boundOnKeyDown: (e: KeyboardEvent) => void;
   private boundOnKeyUp: (e: KeyboardEvent) => void;
   private boundOnPointerUp: (e: PointerEvent) => void;
+  private boundOnOrbitChange: () => void;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -157,11 +178,60 @@ export class Scene {
     this.boundOnKeyDown = this.onKeyDown.bind(this);
     this.boundOnKeyUp = this.onKeyUp.bind(this);
     this.boundOnPointerUp = this.onPointerUp.bind(this);
+    this.boundOnOrbitChange = () => {
+      if (this.pfOptions?.onCameraChange) this.pfOptions.onCameraChange(this.getCameraInfo());
+    };
+  }
+
+  private setCameraPreset(preset: 'front' | 'back' | 'top' | 'bottom' | 'side' | 'left'): void {
+    const target = this.orbitControls.target;
+    const d = this.camera.position.distanceTo(target);
+    switch (preset) {
+      case 'front':
+        this.camera.position.set(target.x, target.y, target.z + d);
+        break;
+      case 'back':
+        this.camera.position.set(target.x, target.y, target.z - d);
+        break;
+      case 'top':
+        this.camera.position.set(target.x, target.y + d, target.z);
+        break;
+      case 'bottom':
+        this.camera.position.set(target.x, target.y - d, target.z);
+        break;
+      case 'side':
+        this.camera.position.set(target.x + d, target.y, target.z);
+        break;
+      case 'left':
+        this.camera.position.set(target.x - d, target.y, target.z);
+        break;
+    }
+    this.camera.lookAt(target);
+    if (this.pfOptions?.onCameraChange) this.pfOptions.onCameraChange(this.getCameraInfo());
   }
 
   private onKeyDown(event: KeyboardEvent): void {
     const key = event.key.toLowerCase();
+    const code = event.code;
     const pfOn = this.pfOptions?.getPFEnabled();
+    if (pfOn) {
+      const shift = event.shiftKey;
+      if (key === '1' || code === 'Numpad1') {
+        event.preventDefault();
+        this.setCameraPreset(shift ? 'back' : 'front');
+        return;
+      }
+      if (key === '3' || code === 'Numpad3') {
+        event.preventDefault();
+        this.setCameraPreset(shift ? 'left' : 'side');
+        return;
+      }
+      if (key === '7' || code === 'Numpad7') {
+        event.preventDefault();
+        this.setCameraPreset(shift ? 'bottom' : 'top');
+        return;
+      }
+    }
     if (pfOn && this.selectedObject) {
       if (key === 'S') {
         event.preventDefault();
@@ -274,6 +344,80 @@ export class Scene {
     if (!this.selectedObject) return;
     this.selectedObject.scale.set(sx, sy, sz);
     this.emitSelectionChange();
+  }
+
+  setCamera(params: CameraParams): void {
+    const target = this.orbitControls.target;
+    if (params.position) {
+      this.camera.position.set(params.position[0], params.position[1], params.position[2]);
+    }
+    if (params.target) {
+      target.set(params.target[0], params.target[1], params.target[2]);
+    }
+    if (params.projection === 'Orthographic') {
+      if (!(this.camera instanceof THREE.OrthographicCamera)) {
+        const aspect = this.canvas.clientWidth / this.canvas.clientHeight || 1;
+        const dist = this.camera.position.distanceTo(target);
+        const fovRad = ((this.camera instanceof THREE.PerspectiveCamera ? this.camera.fov : 50) * Math.PI) / 180;
+        const halfH = Math.tan(fovRad / 2) * dist;
+        const halfW = halfH * aspect;
+        const near = this.camera.near;
+        const far = this.camera.far;
+        const ortho = new THREE.OrthographicCamera(-halfW, halfW, halfH, -halfH, near, far);
+        ortho.position.copy(this.camera.position);
+        ortho.quaternion.copy(this.camera.quaternion);
+        (this.orbitControls as { object: THREE.Camera }).object = ortho;
+        this.camera = ortho;
+      }
+    } else if (params.projection === 'Perspective') {
+      if (!(this.camera instanceof THREE.PerspectiveCamera)) {
+        const persp = new THREE.PerspectiveCamera(50, this.canvas.clientWidth / this.canvas.clientHeight || 1, this.camera.near, this.camera.far);
+        persp.position.copy(this.camera.position);
+        persp.quaternion.copy(this.camera.quaternion);
+        (this.orbitControls as { object: THREE.Camera }).object = persp;
+        this.camera = persp;
+      }
+    }
+    const cam = this.camera;
+    if (params.fov !== undefined && cam instanceof THREE.PerspectiveCamera) {
+      cam.fov = params.fov;
+      cam.updateProjectionMatrix();
+    }
+    if (params.near !== undefined) {
+      cam.near = params.near;
+      cam.updateProjectionMatrix();
+    }
+    if (params.far !== undefined) {
+      cam.far = params.far;
+      cam.updateProjectionMatrix();
+    }
+    if (this.pfOptions?.onCameraChange) {
+      this.pfOptions.onCameraChange(this.getCameraInfo());
+    }
+  }
+
+  private getCameraInfo(): CameraInfo {
+    const pos = this.camera.position;
+    const target = this.orbitControls.target;
+    let projection: 'Perspective' | 'Orthographic' = 'Perspective';
+    let fov = 50;
+    if (this.camera instanceof THREE.PerspectiveCamera) {
+      projection = 'Perspective';
+      fov = this.camera.fov;
+    } else {
+      projection = 'Orthographic';
+      const dist = this.camera.position.distanceTo(target);
+      const halfH = (this.camera.top - this.camera.bottom) / 2;
+      if (dist > 0) fov = (2 * Math.atan(halfH / dist) * 180) / Math.PI;
+    }
+    return {
+      position: { x: pos.x, y: pos.y, z: pos.z },
+      target: { x: target.x, y: target.y, z: target.z },
+      projection,
+      fov,
+      near: this.camera.near,
+      far: this.camera.far,
+    };
   }
 
   private emitSelectionChange(): void {
@@ -711,7 +855,7 @@ export class Scene {
     this.resizeDispose = setupResize(
       this.canvas,
       this.renderer,
-      this.camera
+      () => this.camera
     );
     this.tooltipEl = document.createElement('div');
     this.tooltipEl.style.cssText =
@@ -731,6 +875,13 @@ export class Scene {
     }
     if (this.pfOptions?.setScaleRef) {
       this.pfOptions.setScaleRef.current = this.setSelectedObjectScale.bind(this);
+    }
+    if (this.pfOptions?.setCameraRef) {
+      this.pfOptions.setCameraRef.current = this.setCamera.bind(this);
+    }
+    if (this.pfOptions?.onCameraChange) {
+      this.orbitControls.addEventListener('change', this.boundOnOrbitChange);
+      this.pfOptions.onCameraChange(this.getCameraInfo());
     }
     this.loadAxisHelper();
     this.loadReferenceVehicle();
@@ -784,6 +935,10 @@ export class Scene {
     if (this.pfOptions?.setPositionRef) this.pfOptions.setPositionRef.current = null;
     if (this.pfOptions?.setRotationRef) this.pfOptions.setRotationRef.current = null;
     if (this.pfOptions?.setScaleRef) this.pfOptions.setScaleRef.current = null;
+    if (this.pfOptions?.setCameraRef) this.pfOptions.setCameraRef.current = null;
+    if (this.pfOptions?.onCameraChange) {
+      this.orbitControls.removeEventListener('change', this.boundOnOrbitChange);
+    }
     this.canvas.removeEventListener('pointerdown', this.boundOnPointerDown);
     this.canvas.removeEventListener('pointermove', this.boundOnPointerMove);
     this.canvas.removeEventListener('pointerup', this.boundOnPointerUp);

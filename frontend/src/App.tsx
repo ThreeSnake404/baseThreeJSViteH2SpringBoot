@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { Scene, type SelectedObjectInfo } from './three/Scene';
+import { Scene, type SelectedObjectInfo, type CameraInfo, type CameraParams } from './three/Scene';
 
 const API_BASE = '';
 
@@ -33,10 +33,22 @@ function App() {
   const [inputRz, setInputRz] = useState('0');
   const [inputScale, setInputScale] = useState('1');
   const [inputFocused, setInputFocused] = useState<string | null>(null);
+  const [camPosX, setCamPosX] = useState('0');
+  const [camPosY, setCamPosY] = useState('0');
+  const [camPosZ, setCamPosZ] = useState('5');
+  const [camTgtX, setCamTgtX] = useState('0');
+  const [camTgtY, setCamTgtY] = useState('0');
+  const [camTgtZ, setCamTgtZ] = useState('0');
+  const [camProjection, setCamProjection] = useState<'Perspective' | 'Orthographic'>('Perspective');
+  const [camFov, setCamFov] = useState('50');
+  const [camNear, setCamNear] = useState('0.1');
+  const [camFar, setCamFar] = useState('1000');
+  const cameraInputFocusedRef = useRef(false);
   const pfEnabledRef = useRef(false);
   const setPositionRef = useRef<((x: number, y: number, z: number) => void) | null>(null);
   const setRotationRef = useRef<((rx: number, ry: number, rz: number) => void) | null>(null);
   const setScaleRef = useRef<((sx: number, sy: number, sz: number) => void) | null>(null);
+  const setCameraRef = useRef<((params: CameraParams) => void) | null>(null);
   pfEnabledRef.current = placementFacilityOn;
 
   const onColorChange = useCallback((currentColor: string, nextColor: string) => {
@@ -55,6 +67,20 @@ function App() {
 
   const onSelectionChange = useCallback((info: SelectedObjectInfo) => {
     setSelectedObjectInfo(info);
+  }, []);
+
+  const onCameraChange = useCallback((info: CameraInfo) => {
+    if (cameraInputFocusedRef.current) return;
+    setCamPosX(info.position.x.toFixed(3));
+    setCamPosY(info.position.y.toFixed(3));
+    setCamPosZ(info.position.z.toFixed(3));
+    setCamTgtX(info.target.x.toFixed(3));
+    setCamTgtY(info.target.y.toFixed(3));
+    setCamTgtZ(info.target.z.toFixed(3));
+    setCamProjection(info.projection);
+    setCamFov(info.fov.toFixed(2));
+    setCamNear(info.near.toString());
+    setCamFar(info.far.toString());
   }, []);
 
   useEffect(() => {
@@ -90,14 +116,16 @@ function App() {
       {
         getPFEnabled: () => pfEnabledRef.current,
         onSelectionChange,
+        onCameraChange,
         setPositionRef,
         setRotationRef,
         setScaleRef,
+        setCameraRef,
       }
     );
     scene.start();
     return () => scene.dispose();
-  }, [onColorChange, onSelectionChange]);
+  }, [onColorChange, onSelectionChange, onCameraChange]);
 
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -175,6 +203,27 @@ function App() {
     setInputFocused(null);
   };
 
+  const handleCameraSubmit = () => {
+    cameraInputFocusedRef.current = false;
+    const px = parseFloat(camPosX);
+    const py = parseFloat(camPosY);
+    const pz = parseFloat(camPosZ);
+    const tx = parseFloat(camTgtX);
+    const ty = parseFloat(camTgtY);
+    const tz = parseFloat(camTgtZ);
+    const fov = parseFloat(camFov);
+    const near = parseFloat(camNear);
+    const far = parseFloat(camFar);
+    const params: CameraParams = {};
+    if (Number.isFinite(px) && Number.isFinite(py) && Number.isFinite(pz)) params.position = [px, py, pz];
+    if (Number.isFinite(tx) && Number.isFinite(ty) && Number.isFinite(tz)) params.target = [tx, ty, tz];
+    if (Number.isFinite(fov)) params.fov = fov;
+    if (Number.isFinite(near)) params.near = near;
+    if (Number.isFinite(far)) params.far = far;
+    params.projection = camProjection;
+    setCameraRef.current?.(params);
+  };
+
   const inputStyle: React.CSSProperties = {
     width: 56,
     padding: '4px 6px',
@@ -202,6 +251,64 @@ function App() {
         WebSocket: {wsStatus}
         {placementFacilityOn && ' | Placement Facility ON'}
       </div>
+      {placementFacilityOn && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 12,
+            right: 12,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 6,
+            color: '#fff',
+            textShadow: '0 0 4px #000',
+            fontSize: 12,
+            fontFamily: 'monospace',
+            background: 'rgba(0,0,0,0.7)',
+            padding: 10,
+            borderRadius: 6,
+            border: '1px solid #555',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 88, flexShrink: 0 }}>Position:</span>
+            <label htmlFor="cam-px">x=</label>
+            <input id="cam-px" type="text" value={camPosX} onChange={(e) => setCamPosX(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
+            <label htmlFor="cam-py">y=</label>
+            <input id="cam-py" type="text" value={camPosY} onChange={(e) => setCamPosY(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
+            <label htmlFor="cam-pz">z=</label>
+            <input id="cam-pz" type="text" value={camPosZ} onChange={(e) => setCamPosZ(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 88, flexShrink: 0 }}>Orientation:</span>
+            <label htmlFor="cam-tx">x=</label>
+            <input id="cam-tx" type="text" value={camTgtX} onChange={(e) => setCamTgtX(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
+            <label htmlFor="cam-ty">y=</label>
+            <input id="cam-ty" type="text" value={camTgtY} onChange={(e) => setCamTgtY(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
+            <label htmlFor="cam-tz">z=</label>
+            <input id="cam-tz" type="text" value={camTgtZ} onChange={(e) => setCamTgtZ(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 88, flexShrink: 0 }}>Perspective:</span>
+            <select value={camProjection} onChange={(e) => { setCamProjection(e.target.value as 'Perspective' | 'Orthographic'); setCameraRef.current?.({ projection: e.target.value as 'Perspective' | 'Orthographic' }); }} style={{ ...inputStyle, width: 120 }} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; }}>
+              <option value="Perspective">Perspective</option>
+              <option value="Orthographic">Orthographic</option>
+            </select>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 88, flexShrink: 0 }}>fov</span>
+            <input type="text" value={camFov} onChange={(e) => setCamFov(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 88, flexShrink: 0 }}>Near</span>
+            <input type="text" value={camNear} onChange={(e) => setCamNear(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 88, flexShrink: 0 }}>Far</span>
+            <input type="text" value={camFar} onChange={(e) => setCamFar(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
+          </div>
+        </div>
+      )}
       <input
         type="text"
         value={commandInput}
