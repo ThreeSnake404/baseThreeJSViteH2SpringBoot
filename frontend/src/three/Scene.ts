@@ -10,6 +10,12 @@ const STEER_SPEED = 1.2;
 const MOVE_SPEED = 3;
 /** Length of the drag-axis line (positive and negative) so it goes off screen. */
 const DRAG_AXIS_LINE_EXTENT = 1000;
+/** NDC-to-radians scale for drag-to-rotate (pointer delta -> rotation delta). */
+const ROTATE_SENSITIVITY = 2;
+/** Rest orientation for RotationHelper (90° around Y) — used when loaded and when detached so rotations are always from global X,Y,Z. */
+const ROTATION_HELPER_REST_EULER = { x: 0, y: Math.PI / 2, z: 0 };
+/** Min scale factor to avoid zero or negative. */
+const SCALE_MIN = 0.05;
 
 const CUBE_COLORS = [
   { name: 'red', hex: 0xff0000 },
@@ -22,12 +28,25 @@ const CUBE_COLORS = [
 
 export type OnColorChange = (currentColor: string, nextColor: string) => void;
 
-export type SelectedObjectInfo = { id: string; x: number; y: number; z: number } | null;
+export type SelectedObjectInfo = {
+  id: string;
+  x: number;
+  y: number;
+  z: number;
+  rx: number;
+  ry: number;
+  rz: number;
+  sx: number;
+  sy: number;
+  sz: number;
+} | null;
 
 export type PlacementFacilityOptions = {
   getPFEnabled: () => boolean;
   onSelectionChange: (info: SelectedObjectInfo) => void;
   setPositionRef?: { current: ((x: number, y: number, z: number) => void) | null };
+  setRotationRef?: { current: ((rx: number, ry: number, rz: number) => void) | null };
+  setScaleRef?: { current: ((sx: number, sy: number, sz: number) => void) | null };
 };
 
 /**
@@ -59,13 +78,23 @@ export class Scene {
   private selectionOverlay: THREE.Group | null = null;
   private pointerDownOnSelected = false;
   private gKeyPending = false;
+  private rKeyPending = false;
+  private rotateMode: 'x' | 'y' | 'z' | null = null;
+  private lastPointerRotate: THREE.Vector2 | null = null;
+  private rotationHelperGroup: THREE.Group | null = null;
   private dragMode: 'x' | 'y' | 'z' | null = null;
   private dragStartObjectPosition: THREE.Vector3 | null = null;
   private dragStartIntersection: THREE.Vector3 | null = null;
   private dragAxisLine: THREE.Line | null = null;
+  private scaleMode = false;
+  private scaleStartScale: THREE.Vector3 | null = null;
+  private scaleStartPointerDist = 0;
   private readonly dragPlane = new THREE.Plane();
   private readonly dragPlaneNormal = new THREE.Vector3();
   private readonly dragIntersect = new THREE.Vector3();
+  private readonly rotateAxis = new THREE.Vector3();
+  private readonly rotateQuat = new THREE.Quaternion();
+  private readonly tempVec3 = new THREE.Vector3();
   private resizeDispose: (() => void) | null = null;
   private rafId: number | null = null;
   private disposed = false;
@@ -145,6 +174,11 @@ export class Scene {
           this.gKeyPending = true;
           return;
         }
+        if (key === 'r') {
+          event.preventDefault();
+          this.rKeyPending = true;
+          return;
+        }
         if (this.gKeyPending && (key === 'x' || key === 'y' || key === 'z')) {
           event.preventDefault();
           this.gKeyPending = false;
@@ -156,6 +190,27 @@ export class Scene {
             else if (key === 'y') this.dragPlaneNormal.set(0, 0, 1);
             else this.dragPlaneNormal.set(0, 1, 0);
             this.createDragAxisLine(key);
+          }
+          return;
+        }
+        if (this.rKeyPending && (key === 'x' || key === 'y' || key === 'z')) {
+          event.preventDefault();
+          this.rKeyPending = false;
+          this.rotateMode = key;
+          this.lastPointerRotate = null;
+          if (this.selectedObject && this.rotationHelperGroup) this.attachRotationHelper(key);
+          return;
+        }
+        if (key === 's') {
+          event.preventDefault();
+          this.scaleMode = true;
+          if (this.selectedObject) {
+            this.scaleStartScale = this.selectedObject.scale.clone();
+            this.selectedObject.getWorldPosition(this.tempVec3);
+            this.tempVec3.project(this.camera);
+            const dx = this.pointer.x - this.tempVec3.x;
+            const dy = this.pointer.y - this.tempVec3.y;
+            this.scaleStartPointerDist = Math.max(Math.hypot(dx, dy), 0.01);
           }
           return;
         }
@@ -206,11 +261,36 @@ export class Scene {
   setSelectedObjectPosition(x: number, y: number, z: number): void {
     if (!this.selectedObject) return;
     this.selectedObject.position.set(x, y, z);
-    this.pfOptions?.onSelectionChange({
+    this.emitSelectionChange();
+  }
+
+  setSelectedObjectRotation(rx: number, ry: number, rz: number): void {
+    if (!this.selectedObject) return;
+    this.selectedObject.rotation.set(rx, ry, rz);
+    this.emitSelectionChange();
+  }
+
+  setSelectedObjectScale(sx: number, sy: number, sz: number): void {
+    if (!this.selectedObject) return;
+    this.selectedObject.scale.set(sx, sy, sz);
+    this.emitSelectionChange();
+  }
+
+  private emitSelectionChange(): void {
+    if (!this.selectedObject || !this.pfOptions) return;
+    const r = this.selectedObject.rotation;
+    const s = this.selectedObject.scale;
+    this.pfOptions.onSelectionChange({
       id: this.getObjectId(this.selectedObject),
-      x,
-      y,
-      z,
+      x: this.selectedObject.position.x,
+      y: this.selectedObject.position.y,
+      z: this.selectedObject.position.z,
+      rx: r.x,
+      ry: r.y,
+      rz: r.z,
+      sx: s.x,
+      sy: s.y,
+      sz: s.z,
     });
   }
 
@@ -249,13 +329,38 @@ export class Scene {
       });
       this.selectionOverlay = null;
     }
+    if (!root) {
+      if (this.rotateMode) {
+        this.attachRotationHelper(null);
+        this.rotateMode = null;
+        this.lastPointerRotate = null;
+      }
+      if (this.scaleMode) {
+        this.scaleMode = false;
+        this.scaleStartScale = null;
+        this.scaleStartPointerDist = 0;
+      }
+    }
     this.selectedObject = root;
     if (root) {
       this.selectionOverlay = this.createSelectionOverlay(root);
       root.add(this.selectionOverlay);
     }
     this.pfOptions?.onSelectionChange(
-      root ? { id: this.getObjectId(root), x: root.position.x, y: root.position.y, z: root.position.z } : null
+      root
+        ? {
+            id: this.getObjectId(root),
+            x: root.position.x,
+            y: root.position.y,
+            z: root.position.z,
+            rx: root.rotation.x,
+            ry: root.rotation.y,
+            rz: root.rotation.z,
+            sx: root.scale.x,
+            sy: root.scale.y,
+            sz: root.scale.z,
+          }
+        : null
     );
   }
 
@@ -268,6 +373,40 @@ export class Scene {
   private onPointerMove(event: PointerEvent): void {
     if (this.disposed) return;
     this.updatePointerFromEvent(event);
+    if (this.rotateMode && this.selectedObject) {
+      if (this.lastPointerRotate === null) {
+        this.lastPointerRotate = this.pointer.clone();
+      } else {
+        const dx = this.pointer.x - this.lastPointerRotate.x;
+        const dy = this.pointer.y - this.lastPointerRotate.y;
+        const s = ROTATE_SENSITIVITY;
+        const angle = (this.rotateMode === 'x' ? -dy : this.rotateMode === 'z' ? -dx : dx) * s;
+        if (this.rotateMode === 'x') this.rotateAxis.set(1, 0, 0);
+        else if (this.rotateMode === 'y') this.rotateAxis.set(0, 1, 0);
+        else this.rotateAxis.set(0, 0, 1);
+        this.rotateQuat.setFromAxisAngle(this.rotateAxis, angle);
+        this.selectedObject.quaternion.premultiply(this.rotateQuat);
+        this.lastPointerRotate.copy(this.pointer);
+        this.emitSelectionChange();
+      }
+      return;
+    }
+    if (this.scaleMode && this.selectedObject && this.scaleStartScale) {
+      this.selectedObject.getWorldPosition(this.tempVec3);
+      this.tempVec3.project(this.camera);
+      const dx = this.pointer.x - this.tempVec3.x;
+      const dy = this.pointer.y - this.tempVec3.y;
+      const currentDist = Math.max(Math.hypot(dx, dy), 0.01);
+      const ratio = currentDist / this.scaleStartPointerDist;
+      const s = this.scaleStartScale;
+      this.selectedObject.scale.set(
+        Math.max(s.x * ratio, SCALE_MIN),
+        Math.max(s.y * ratio, SCALE_MIN),
+        Math.max(s.z * ratio, SCALE_MIN)
+      );
+      this.emitSelectionChange();
+      return;
+    }
     if (this.dragMode && this.selectedObject) {
       this.raycaster.setFromCamera(this.pointer, this.camera);
       this.dragPlane.normal.copy(this.dragPlaneNormal);
@@ -284,15 +423,7 @@ export class Scene {
           if (this.dragMode === 'y') this.selectedObject.position.y = this.dragStartObjectPosition.y + dy;
           if (this.dragMode === 'z') this.selectedObject.position.z = this.dragStartObjectPosition.z + dz;
         }
-        if (this.selectedObject && this.pfOptions) {
-          const p = this.selectedObject.position;
-          this.pfOptions.onSelectionChange({
-            id: this.getObjectId(this.selectedObject),
-            x: p.x,
-            y: p.y,
-            z: p.z,
-          });
-        }
+        if (this.selectedObject) this.emitSelectionChange();
       }
       return;
     }
@@ -457,15 +588,19 @@ export class Scene {
       this.dragMode = null;
       this.dragStartObjectPosition = null;
       this.dragStartIntersection = null;
-      if (this.selectedObject && this.pfOptions) {
-        this.pfOptions.onSelectionChange({
-          id: this.getObjectId(this.selectedObject),
-          x: this.selectedObject.position.x,
-          y: this.selectedObject.position.y,
-          z: this.selectedObject.position.z,
-        });
-      }
+      if (this.selectedObject) this.emitSelectionChange();
     }
+    if (this.rotateMode) {
+      this.attachRotationHelper(null);
+      this.rotateMode = null;
+      this.lastPointerRotate = null;
+    }
+    if (this.scaleMode) {
+      this.scaleMode = false;
+      this.scaleStartScale = null;
+      this.scaleStartPointerDist = 0;
+    }
+    this.rKeyPending = false;
     this.canvas.releasePointerCapture?.(event.pointerId);
   };
 
@@ -506,6 +641,72 @@ export class Scene {
     }
   }
 
+  private attachRotationHelper(axis: 'x' | 'y' | 'z' | null): void {
+    if (!this.rotationHelperGroup) return;
+    if (this.rotationHelperGroup.parent) this.rotationHelperGroup.parent.remove(this.rotationHelperGroup);
+    if (axis === null) {
+      this.scene.add(this.rotationHelperGroup);
+      this.rotationHelperGroup.visible = false;
+      this.rotationHelperGroup.position.set(0, 0, 0);
+      this.rotationHelperGroup.rotation.set(
+        ROTATION_HELPER_REST_EULER.x,
+        ROTATION_HELPER_REST_EULER.y,
+        ROTATION_HELPER_REST_EULER.z
+      );
+      this.rotationHelperGroup.scale.set(1, 1, 1);
+      return;
+    }
+    if (!this.selectedObject) return;
+    this.scene.add(this.rotationHelperGroup);
+    this.selectedObject.getWorldPosition(this.tempVec3);
+    this.rotationHelperGroup.position.copy(this.tempVec3);
+    // Same orientation for all axes: z at camera, x right, y up (matches X rotation start)
+    const helperY180 = Math.PI;
+    this.rotationHelperGroup.rotation.set(0, helperY180, 0);
+    this.rotationHelperGroup.scale.set(1, 1, 1);
+    this.rotationHelperGroup.visible = true;
+  }
+
+  private loadRotationHelper(): void {
+    if (this.disposed) return;
+    const loader = new GLTFLoader();
+    loader.load(
+      '/models/RotationHelper_01.glb',
+      (gltf) => {
+        if (this.disposed) {
+          gltf.scene.traverse((obj) => {
+            if (obj instanceof THREE.Mesh) {
+              obj.geometry?.dispose();
+              if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+              else obj.material?.dispose();
+            }
+          });
+          return;
+        }
+        this.rotationHelperGroup = gltf.scene;
+        this.rotationHelperGroup.visible = false;
+        this.rotationHelperGroup.position.set(0, 0, 0);
+        this.rotationHelperGroup.rotation.set(
+          ROTATION_HELPER_REST_EULER.x,
+          ROTATION_HELPER_REST_EULER.y,
+          ROTATION_HELPER_REST_EULER.z
+        );
+        this.scene.add(this.rotationHelperGroup);
+      },
+      undefined,
+      (err) => {
+        const msg = (err as Error)?.message ?? String(err);
+        if (msg.includes('<!DOCTYPE') || msg.includes('not valid JSON')) {
+          console.error(
+            'RotationHelper_01.glb not found: server returned HTML. Add frontend/public/models/RotationHelper_01.glb'
+          );
+        } else {
+          console.error('Failed to load RotationHelper_01.glb:', err);
+        }
+      }
+    );
+  }
+
   start(): void {
     this.resizeDispose = setupResize(
       this.canvas,
@@ -525,14 +726,22 @@ export class Scene {
     if (this.pfOptions?.setPositionRef) {
       this.pfOptions.setPositionRef.current = this.setSelectedObjectPosition.bind(this);
     }
+    if (this.pfOptions?.setRotationRef) {
+      this.pfOptions.setRotationRef.current = this.setSelectedObjectRotation.bind(this);
+    }
+    if (this.pfOptions?.setScaleRef) {
+      this.pfOptions.setScaleRef.current = this.setSelectedObjectScale.bind(this);
+    }
     this.loadAxisHelper();
     this.loadReferenceVehicle();
+    this.loadRotationHelper();
     const loop = () => {
       if (this.disposed) return;
       this.rafId = requestAnimationFrame(loop);
       const dt = this.clock.getDelta();
       if (this.axisHelperGroup) {
-        this.axisHelperGroup.visible = this.pfOptions?.getPFEnabled() ?? false;
+        const pfOn = this.pfOptions?.getPFEnabled() ?? false;
+        this.axisHelperGroup.visible = pfOn && (this.gKeyPending || this.dragMode !== null);
       }
       this.orbitControls.enabled = !(
         this.pfOptions?.getPFEnabled() && this.selectedObject !== null
@@ -562,7 +771,19 @@ export class Scene {
   dispose(): void {
     this.disposed = true;
     this.removeDragAxisLine();
+    this.attachRotationHelper(null);
+    if (this.rotationHelperGroup) {
+      this.rotationHelperGroup.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.geometry?.dispose();
+          if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+          else (obj.material as THREE.Material)?.dispose();
+        }
+      });
+    }
     if (this.pfOptions?.setPositionRef) this.pfOptions.setPositionRef.current = null;
+    if (this.pfOptions?.setRotationRef) this.pfOptions.setRotationRef.current = null;
+    if (this.pfOptions?.setScaleRef) this.pfOptions.setScaleRef.current = null;
     this.canvas.removeEventListener('pointerdown', this.boundOnPointerDown);
     this.canvas.removeEventListener('pointermove', this.boundOnPointerMove);
     this.canvas.removeEventListener('pointerup', this.boundOnPointerUp);

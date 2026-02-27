@@ -3,6 +3,9 @@ import { Scene, type SelectedObjectInfo } from './three/Scene';
 
 const API_BASE = '';
 
+const radToDeg = (rad: number): number => (rad * 180) / Math.PI;
+const degToRad = (deg: number): number => (deg * Math.PI) / 180;
+
 function generateGuid(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID();
@@ -25,9 +28,15 @@ function App() {
   const [inputX, setInputX] = useState('0');
   const [inputY, setInputY] = useState('0');
   const [inputZ, setInputZ] = useState('0');
+  const [inputRx, setInputRx] = useState('0');
+  const [inputRy, setInputRy] = useState('0');
+  const [inputRz, setInputRz] = useState('0');
+  const [inputScale, setInputScale] = useState('1');
   const [inputFocused, setInputFocused] = useState<string | null>(null);
   const pfEnabledRef = useRef(false);
   const setPositionRef = useRef<((x: number, y: number, z: number) => void) | null>(null);
+  const setRotationRef = useRef<((rx: number, ry: number, rz: number) => void) | null>(null);
+  const setScaleRef = useRef<((sx: number, sy: number, sz: number) => void) | null>(null);
   pfEnabledRef.current = placementFacilityOn;
 
   const onColorChange = useCallback((currentColor: string, nextColor: string) => {
@@ -54,10 +63,19 @@ function App() {
         setInputX(selectedObjectInfo.x.toString());
         setInputY(selectedObjectInfo.y.toString());
         setInputZ(selectedObjectInfo.z.toString());
+        setInputRx(radToDeg(selectedObjectInfo.rx).toFixed(2));
+        setInputRy(radToDeg(selectedObjectInfo.ry).toFixed(2));
+        setInputRz(radToDeg(selectedObjectInfo.rz).toFixed(2));
+        const s = (selectedObjectInfo.sx + selectedObjectInfo.sy + selectedObjectInfo.sz) / 3;
+        setInputScale(s.toFixed(2));
       } else {
         setInputX('0');
         setInputY('0');
         setInputZ('0');
+        setInputRx('0');
+        setInputRy('0');
+        setInputRz('0');
+        setInputScale('1');
       }
     }
   }, [selectedObjectInfo, inputFocused]);
@@ -73,6 +91,8 @@ function App() {
         getPFEnabled: () => pfEnabledRef.current,
         onSelectionChange,
         setPositionRef,
+        setRotationRef,
+        setScaleRef,
       }
     );
     scene.start();
@@ -137,6 +157,24 @@ function App() {
     setInputFocused(null);
   };
 
+  const handleRotationSubmit = () => {
+    const rx = parseFloat(inputRx);
+    const ry = parseFloat(inputRy);
+    const rz = parseFloat(inputRz);
+    if (Number.isFinite(rx) && Number.isFinite(ry) && Number.isFinite(rz)) {
+      setRotationRef.current?.(degToRad(rx), degToRad(ry), degToRad(rz));
+    }
+    setInputFocused(null);
+  };
+
+  const handleScaleSubmit = () => {
+    const s = parseFloat(inputScale);
+    if (Number.isFinite(s)) {
+      setScaleRef.current?.(s, s, s);
+    }
+    setInputFocused(null);
+  };
+
   const inputStyle: React.CSSProperties = {
     width: 56,
     padding: '4px 6px',
@@ -190,51 +228,124 @@ function App() {
             bottom: 16,
             right: 72,
             display: 'flex',
-            alignItems: 'center',
-            gap: 8,
+            flexDirection: 'column',
+            gap: 6,
             color: '#fff',
             textShadow: '0 0 4px #000',
             fontSize: 12,
             fontFamily: 'monospace',
           }}
         >
-          <label htmlFor="pf-id">Selected Object id=</label>
-          <span id="pf-id" style={{ marginRight: 4 }}>
-            {selectedObjectInfo ? selectedObjectInfo.id : 'none'}
-          </span>
-          <label htmlFor="pf-x">x=</label>
-          <input
-            id="pf-x"
-            type="text"
-            value={inputX}
-            onChange={(e) => setInputX(e.target.value)}
-            onFocus={() => setInputFocused('x')}
-            onBlur={() => setInputFocused(null)}
-            onKeyDown={(e) => e.key === 'Enter' && handlePositionSubmit()}
-            style={inputStyle}
-          />
-          <label htmlFor="pf-y">y=</label>
-          <input
-            id="pf-y"
-            type="text"
-            value={inputY}
-            onChange={(e) => setInputY(e.target.value)}
-            onFocus={() => setInputFocused('y')}
-            onBlur={() => setInputFocused(null)}
-            onKeyDown={(e) => e.key === 'Enter' && handlePositionSubmit()}
-            style={inputStyle}
-          />
-          <label htmlFor="pf-z">z=</label>
-          <input
-            id="pf-z"
-            type="text"
-            value={inputZ}
-            onChange={(e) => setInputZ(e.target.value)}
-            onFocus={() => setInputFocused('z')}
-            onBlur={() => setInputFocused(null)}
-            onKeyDown={(e) => e.key === 'Enter' && handlePositionSubmit()}
-            style={inputStyle}
-          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 120, flexShrink: 0 }}>Scale:</span>
+            <label htmlFor="pf-sx">x=</label>
+            <input
+              id="pf-sx"
+              type="text"
+              value={inputScale}
+              onChange={(e) => setInputScale(e.target.value)}
+              onFocus={() => setInputFocused('scale')}
+              onBlur={() => setInputFocused(null)}
+              onKeyDown={(e) => e.key === 'Enter' && handleScaleSubmit()}
+              style={inputStyle}
+            />
+            <label htmlFor="pf-sy">y=</label>
+            <input
+              id="pf-sy"
+              type="text"
+              value={inputScale}
+              onChange={(e) => setInputScale(e.target.value)}
+              onFocus={() => setInputFocused('scale')}
+              onBlur={() => setInputFocused(null)}
+              onKeyDown={(e) => e.key === 'Enter' && handleScaleSubmit()}
+              style={inputStyle}
+            />
+            <label htmlFor="pf-sz">z=</label>
+            <input
+              id="pf-sz"
+              type="text"
+              value={inputScale}
+              onChange={(e) => setInputScale(e.target.value)}
+              onFocus={() => setInputFocused('scale')}
+              onBlur={() => setInputFocused(null)}
+              onKeyDown={(e) => e.key === 'Enter' && handleScaleSubmit()}
+              style={inputStyle}
+            />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 120, flexShrink: 0 }}>Rotation:</span>
+            <label htmlFor="pf-rx">x=</label>
+            <input
+              id="pf-rx"
+              type="text"
+              value={inputRx}
+              onChange={(e) => setInputRx(e.target.value)}
+              onFocus={() => setInputFocused('rx')}
+              onBlur={() => setInputFocused(null)}
+              onKeyDown={(e) => e.key === 'Enter' && handleRotationSubmit()}
+              style={inputStyle}
+            />
+            <label htmlFor="pf-ry">y=</label>
+            <input
+              id="pf-ry"
+              type="text"
+              value={inputRy}
+              onChange={(e) => setInputRy(e.target.value)}
+              onFocus={() => setInputFocused('ry')}
+              onBlur={() => setInputFocused(null)}
+              onKeyDown={(e) => e.key === 'Enter' && handleRotationSubmit()}
+              style={inputStyle}
+            />
+            <label htmlFor="pf-rz">z=</label>
+            <input
+              id="pf-rz"
+              type="text"
+              value={inputRz}
+              onChange={(e) => setInputRz(e.target.value)}
+              onFocus={() => setInputFocused('rz')}
+              onBlur={() => setInputFocused(null)}
+              onKeyDown={(e) => e.key === 'Enter' && handleRotationSubmit()}
+              style={inputStyle}
+            />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span id="pf-id" style={{ width: 120, flexShrink: 0 }}>
+              Selected Object id= {selectedObjectInfo ? selectedObjectInfo.id : 'none'}
+            </span>
+            <label htmlFor="pf-x">x=</label>
+            <input
+              id="pf-x"
+              type="text"
+              value={inputX}
+              onChange={(e) => setInputX(e.target.value)}
+              onFocus={() => setInputFocused('x')}
+              onBlur={() => setInputFocused(null)}
+              onKeyDown={(e) => e.key === 'Enter' && handlePositionSubmit()}
+              style={inputStyle}
+            />
+            <label htmlFor="pf-y">y=</label>
+            <input
+              id="pf-y"
+              type="text"
+              value={inputY}
+              onChange={(e) => setInputY(e.target.value)}
+              onFocus={() => setInputFocused('y')}
+              onBlur={() => setInputFocused(null)}
+              onKeyDown={(e) => e.key === 'Enter' && handlePositionSubmit()}
+              style={inputStyle}
+            />
+            <label htmlFor="pf-z">z=</label>
+            <input
+              id="pf-z"
+              type="text"
+              value={inputZ}
+              onChange={(e) => setInputZ(e.target.value)}
+              onFocus={() => setInputFocused('z')}
+              onBlur={() => setInputFocused(null)}
+              onKeyDown={(e) => e.key === 'Enter' && handlePositionSubmit()}
+              style={inputStyle}
+            />
+          </div>
         </div>
       )}
       <button
