@@ -1,15 +1,15 @@
 ---
-description: STS command — when user types STS, add all, commit with auto message, push
+description: STS — add all, commit with auto message, push to GitHub
 alwaysApply: true
 ---
 
-# STS command (this project)
+# STS command
 
-When the user types **STS** in capital letters (and nothing else, or as a standalone request), treat it as the "STS" command for this project. You must:
+When the user types **STS** (and nothing else, or as a standalone request), run this git workflow:
 
-1. **Add all** — Run `git add -A` to stage all new, modified, and deleted files.
-2. **Inspect changes** — Run `git status` and `git diff --stat HEAD` (and if needed `git diff HEAD` or `git log -1 --stat`) to see what changed since the last commit.
-3. **Commit with a meaningful message** — Create a single commit with a short summary line and optional bullet points that accurately describe the changes (new features, fixes, refactors, etc.). Use `git commit -m "..."`.
-4. **Push** — Run `git push` to push to the remote (e.g. `origin`).
+1. **Add all** — `git add -A` to stage new, modified, and deleted files.
+2. **Inspect** — `git status` and `git diff --stat HEAD` (or `git diff HEAD`) to see what changed.
+3. **Commit** — One commit with a short, accurate message summarizing the changes. Use `git commit -m "..."`. Generate the message yourself from the diff; do not ask the user.
+4. **Push** — `git push` (or `git push origin <current-branch>`) to push to the online GitHub repo for this branch.
 
-Do not ask for confirmation or for the user to type the commit message. Generate the commit message yourself from the changes. If there is nothing to commit, say so and do not push. If push fails (e.g. auth or conflict), report the error and stop.
+Do not ask for confirmation or a commit message. If there is nothing to commit, say so and skip push. If push fails, report the error and stop.
