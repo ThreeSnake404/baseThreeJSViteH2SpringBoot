@@ -1,5 +1,12 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { Scene, type SelectedObjectInfo, type CameraInfo, type CameraParams } from './three/Scene';
+import {
+  Scene,
+  type SelectedObjectInfo,
+  type CameraInfo,
+  type CameraParams,
+  type HoverInfo,
+} from './three/Scene';
+import { BatteryRack } from './BatteryRack';
 
 const API_BASE = '';
 
@@ -44,11 +51,15 @@ function App() {
   const [camNear, setCamNear] = useState('0.1');
   const [camFar, setCamFar] = useState('1000');
   const cameraInputFocusedRef = useRef(false);
+  const initialCameraDistanceRef = useRef<number | null>(null);
+  const [zoomLevel, setZoomLevel] = useState<'high' | 'med' | 'low'>('high');
   const pfEnabledRef = useRef(false);
   const setPositionRef = useRef<((x: number, y: number, z: number) => void) | null>(null);
   const setRotationRef = useRef<((rx: number, ry: number, rz: number) => void) | null>(null);
   const setScaleRef = useRef<((sx: number, sy: number, sz: number) => void) | null>(null);
   const setCameraRef = useRef<((params: CameraParams) => void) | null>(null);
+  const batteryApiRef = useRef<import('./three/Scene').BatteryApi | null>(null);
+  const [hoverInfo, setHoverInfo] = useState<HoverInfo>(null);
   pfEnabledRef.current = placementFacilityOn;
 
   const onColorChange = useCallback((currentColor: string, nextColor: string) => {
@@ -81,7 +92,52 @@ function App() {
     setCamFov(info.fov.toFixed(2));
     setCamNear(info.near.toString());
     setCamFar(info.far.toString());
+    const dx = info.position.x - info.target.x;
+    const dy = info.position.y - info.target.y;
+    const dz = info.position.z - info.target.z;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (!initialCameraDistanceRef.current && dist > 0) {
+      initialCameraDistanceRef.current = dist;
+    }
   }, []);
+
+  const onHoverInfoChange = useCallback((info: HoverInfo) => {
+    setHoverInfo(info);
+  }, []);
+
+  const applyZoom = (multiplier: number) => {
+    const base = initialCameraDistanceRef.current;
+    if (!base || !setCameraRef.current) return;
+    const px = parseFloat(camPosX);
+    const py = parseFloat(camPosY);
+    const pz = parseFloat(camPosZ);
+    const tx = parseFloat(camTgtX);
+    const ty = parseFloat(camTgtY);
+    const tz = parseFloat(camTgtZ);
+    if (
+      !Number.isFinite(px) ||
+      !Number.isFinite(py) ||
+      !Number.isFinite(pz) ||
+      !Number.isFinite(tx) ||
+      !Number.isFinite(ty) ||
+      !Number.isFinite(tz)
+    ) {
+      return;
+    }
+    const dx = px - tx;
+    const dy = py - ty;
+    const dz = pz - tz;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+    const newDist = base * multiplier;
+    const scale = newDist / len;
+    const nx = tx + dx * scale;
+    const ny = ty + dy * scale;
+    const nz = tz + dz * scale;
+    setCameraRef.current?.({
+      position: [nx, ny, nz],
+      target: [tx, ty, tz],
+    });
+  };
 
   useEffect(() => {
     if (!inputFocused) {
@@ -117,15 +173,17 @@ function App() {
         getPFEnabled: () => pfEnabledRef.current,
         onSelectionChange,
         onCameraChange,
+        onHoverInfoChange,
         setPositionRef,
         setRotationRef,
         setScaleRef,
         setCameraRef,
+        batteryApiRef,
       }
     );
     scene.start();
     return () => scene.dispose();
-  }, [onColorChange, onSelectionChange, onCameraChange]);
+  }, [onColorChange, onSelectionChange, onCameraChange, onHoverInfoChange]);
 
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -238,6 +296,103 @@ function App() {
   return (
     <>
       <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
+      {/* Battery rack on the map surface, near the top edge of the ShinyPath. */}
+      <BatteryRack index={0} apiRef={batteryApiRef} position={[0, 0.05, 8.5]} />
+      {hoverInfo && (
+        <div
+          style={{
+            position: 'fixed',
+            left: hoverInfo.screenX + 12,
+            top: hoverInfo.screenY + 12,
+            background: 'rgba(0,0,0,0.85)',
+            color: '#fff',
+            padding: '4px 8px',
+            borderRadius: 4,
+            fontSize: 11,
+            fontFamily: 'monospace',
+            pointerEvents: 'none',
+            zIndex: 2000,
+          }}
+        >
+          {hoverInfo.label}
+        </div>
+      )}
+      <div
+        style={{
+          position: 'absolute',
+          top: 60,
+          left: 12,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 6,
+        }}
+      >
+        {(['high', 'med', 'low'] as const).map((level) => {
+          const label = level === 'high' ? 'High' : level === 'med' ? 'Med' : 'Low';
+          const onClick =
+            level === 'high'
+              ? () => {
+                  setZoomLevel('high');
+                  applyZoom(1);
+                }
+              : level === 'med'
+              ? () => {
+                  setZoomLevel('med');
+                  applyZoom(1 / 2);
+                }
+              : () => {
+                  setZoomLevel('low');
+                  applyZoom(1 / 4);
+                };
+          const active = zoomLevel === level;
+          return (
+            <button
+              key={level}
+              type="button"
+              onClick={onClick}
+              style={{
+                padding: '4px 10px',
+                fontSize: 12,
+                borderRadius: 4,
+                border: '1px solid #555',
+                background: active ? '#666' : '#444',
+                color: '#eee',
+                cursor: 'pointer',
+              }}
+            >
+              {label}
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          style={{
+            padding: '4px 10px',
+            fontSize: 12,
+            borderRadius: 4,
+            border: '1px solid #555',
+            background: '#444',
+            color: '#eee',
+            cursor: 'pointer',
+          }}
+        >
+          Route
+        </button>
+        <button
+          type="button"
+          style={{
+            padding: '4px 10px',
+            fontSize: 12,
+            borderRadius: 4,
+            border: '1px solid #555',
+            background: '#444',
+            color: '#eee',
+            cursor: 'pointer',
+          }}
+        >
+          Manual
+        </button>
+      </div>
       <div
         style={{
           position: 'absolute',

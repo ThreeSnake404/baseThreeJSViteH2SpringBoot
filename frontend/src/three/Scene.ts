@@ -16,6 +16,22 @@ const ROTATE_SENSITIVITY = 2;
 const ROTATION_HELPER_REST_EULER = { x: 0, y: Math.PI / 2, z: 0 };
 /** Min scale factor to avoid zero or negative. */
 const SCALE_MIN = 0.05;
+/** Number of stacked planes per battery (forms a square when viewed). */
+const BATTERY_SEGMENTS = 10;
+/** Full cycle duration in seconds for empty-battery blink (yellow → red → yellow). */
+const BATTERY_BLINK_CYCLE = 1;
+/** Rack layout: battery width 1, gap = 1/5 of width; same gap between border and first/last battery. */
+const RACK_BATTERY_WIDTH = 1;
+const RACK_GAP = RACK_BATTERY_WIDTH / 5;
+const RACK_PANEL_WIDTH = 4 * RACK_BATTERY_WIDTH + 3 * RACK_GAP + 2 * RACK_GAP;
+const RACK_PANEL_HEIGHT = 1.2;
+const RACK_CORNER_RADIUS = 0.15;
+const RACK_BATTERY_X_OFFSETS: [number, number, number, number] = [
+  -RACK_PANEL_WIDTH / 2 + RACK_GAP + RACK_BATTERY_WIDTH / 2,
+  -RACK_PANEL_WIDTH / 2 + RACK_GAP + RACK_BATTERY_WIDTH / 2 + (RACK_BATTERY_WIDTH + RACK_GAP),
+  -RACK_PANEL_WIDTH / 2 + RACK_GAP + RACK_BATTERY_WIDTH / 2 + 2 * (RACK_BATTERY_WIDTH + RACK_GAP),
+  -RACK_PANEL_WIDTH / 2 + RACK_GAP + RACK_BATTERY_WIDTH / 2 + 3 * (RACK_BATTERY_WIDTH + RACK_GAP),
+];
 
 const CUBE_COLORS = [
   { name: 'red', hex: 0xff0000 },
@@ -59,14 +75,38 @@ export type CameraParams = {
   projection?: 'Perspective' | 'Orthographic';
 };
 
+export type HoverInfo = {
+  label: string;
+  screenX: number;
+  screenY: number;
+} | null;
+
+export type BatteryApi = {
+  createBattery: (
+    id: string,
+    position?: [number, number, number],
+    parent?: THREE.Object3D
+  ) => void;
+  setBatteryCharge: (id: string, charge: number) => void;
+  removeBattery: (id: string) => void;
+  createBatteryRack: (
+    rackId: string,
+    position?: [number, number, number],
+    initialCharges?: number[]
+  ) => void;
+  removeBatteryRack: (rackId: string) => void;
+};
+
 export type PlacementFacilityOptions = {
   getPFEnabled: () => boolean;
   onSelectionChange: (info: SelectedObjectInfo) => void;
   onCameraChange?: (info: CameraInfo) => void;
+  onHoverInfoChange?: (info: HoverInfo) => void;
   setPositionRef?: { current: ((x: number, y: number, z: number) => void) | null };
   setRotationRef?: { current: ((rx: number, ry: number, rz: number) => void) | null };
   setScaleRef?: { current: ((sx: number, sy: number, sz: number) => void) | null };
   setCameraRef?: { current: ((params: CameraParams) => void) | null };
+  batteryApiRef?: { current: BatteryApi | null };
 };
 
 /**
@@ -78,6 +118,7 @@ export class Scene {
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
   private camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+  private initialCameraDistance = 0;
   private readonly clock: THREE.Clock;
   private readonly cubeMesh: THREE.Mesh;
   private readonly markerSphere: THREE.Mesh;
@@ -87,6 +128,8 @@ export class Scene {
   private readonly referenceVehicleUrl?: string;
   private axisHelperGroup: THREE.Group | null = null;
   private referenceVehicleGroup: THREE.Group | null = null;
+  private shinyPathGroup: THREE.Group | null = null;
+  private buggyGroup: THREE.Group | null = null;
   private colorIndex = 0;
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointer = new THREE.Vector2();
@@ -109,6 +152,12 @@ export class Scene {
   private scaleMode = false;
   private scaleStartScale: THREE.Vector3 | null = null;
   private scaleStartPointerDist = 0;
+  private readonly batteries = new Map<
+    string,
+    { group: THREE.Group; planes: THREE.Mesh[]; charge: number }
+  >();
+  private readonly racks = new Map<string, THREE.Group>();
+  private mapHalfExtent = 10;
   private readonly dragPlane = new THREE.Plane();
   private readonly dragPlaneNormal = new THREE.Vector3();
   private readonly dragIntersect = new THREE.Vector3();
@@ -145,7 +194,8 @@ export class Scene {
       0.1,
       1000
     );
-    this.camera.position.set(0, 0, 5);
+    // Temporary initial position; will be updated after ShinyPath loads.
+    this.camera.position.set(0, 22, 0);
     this.camera.lookAt(0, 0, 0);
     this.orbitControls = new OrbitControls(this.camera, this.canvas);
     this.orbitControls.target.set(0, 0, 0);
@@ -208,6 +258,182 @@ export class Scene {
     }
     this.camera.lookAt(target);
     if (this.pfOptions?.onCameraChange) this.pfOptions.onCameraChange(this.getCameraInfo());
+  }
+
+  private createBattery(
+    id: string,
+    position?: [number, number, number],
+    parent?: THREE.Object3D
+  ): void {
+    if (this.batteries.has(id)) return;
+    const group = new THREE.Group();
+    const planes: THREE.Mesh[] = [];
+    const segW = RACK_BATTERY_WIDTH;
+    const segH = segW / BATTERY_SEGMENTS;
+    for (let i = 0; i < BATTERY_SEGMENTS; i++) {
+      const geom = new THREE.PlaneGeometry(segW, segH);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x333333,
+        emissive: 0xff0000,
+        emissiveIntensity: 0.6,
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.y = (i + 0.5) * segH - segW / 2;
+      group.add(mesh);
+      planes.push(mesh);
+    }
+    if (position) group.position.set(position[0], position[1], position[2]);
+    if (parent) {
+      group.rotation.x = -Math.PI / 2;
+      parent.add(group);
+    } else {
+      this.scene.add(group);
+    }
+    this.batteries.set(id, { group, planes, charge: 0 });
+    this.updateBatteryColors(id, 0);
+  }
+
+  private makeRoundedRectShape(w: number, h: number, r: number): THREE.Shape {
+    const shape = new THREE.Shape();
+    const x = w / 2 - r;
+    const y = h / 2 - r;
+    shape.moveTo(-x, -h / 2);
+    shape.lineTo(x, -h / 2);
+    shape.absarc(w / 2 - r, -h / 2 + r, r, -Math.PI / 2, 0);
+    shape.lineTo(w / 2, h / 2 - r);
+    shape.absarc(w / 2 - r, h / 2 - r, r, 0, Math.PI / 2);
+    shape.lineTo(-w / 2 + r, h / 2);
+    shape.absarc(-w / 2 + r, h / 2 - r, r, Math.PI / 2, Math.PI);
+    shape.lineTo(-w / 2, -h / 2 + r);
+    shape.absarc(-w / 2 + r, -h / 2 + r, r, Math.PI, Math.PI * 1.5);
+    return shape;
+  }
+
+  private createBatteryRack(
+    rackId: string,
+    position?: [number, number, number],
+    initialCharges?: number[]
+  ): void {
+    if (this.racks.has(rackId)) return;
+    const rackGroup = new THREE.Group();
+    rackGroup.name = rackId;
+    if (position) rackGroup.position.set(position[0], position[1], position[2]);
+
+    const shape = this.makeRoundedRectShape(
+      RACK_PANEL_WIDTH,
+      RACK_PANEL_HEIGHT,
+      RACK_CORNER_RADIUS
+    );
+    const panelGeom = new THREE.ShapeGeometry(shape);
+    const panelMat = new THREE.MeshStandardMaterial({
+      color: 0x1a1a1a,
+      emissive: 0x000000,
+    });
+    const panelMesh = new THREE.Mesh(panelGeom, panelMat);
+    panelMesh.rotation.x = -Math.PI / 2;
+    rackGroup.add(panelMesh);
+
+    const borderPoints2D = shape.getPoints(24);
+    const borderPoints3D = borderPoints2D.map(
+      (p) => new THREE.Vector3(p.x, p.y, 0)
+    );
+    const borderGeom = new THREE.BufferGeometry().setFromPoints(borderPoints3D);
+    const borderMat = new THREE.LineBasicMaterial({
+      color: 0xffffff,
+    });
+    const borderLine = new THREE.LineLoop(borderGeom, borderMat);
+    borderLine.rotation.x = -Math.PI / 2;
+    rackGroup.add(borderLine);
+
+    for (let i = 0; i < 4; i++) {
+      const batId = `${rackId}-battery-${i + 1}`;
+      this.createBattery(
+        batId,
+        [RACK_BATTERY_X_OFFSETS[i], 0, 0],
+        rackGroup
+      );
+      if (initialCharges && initialCharges[i] !== undefined) {
+        this.setBatteryCharge(batId, initialCharges[i]);
+      }
+    }
+
+    rackGroup.scale.set(0.25, 0.25, 0.25);
+    this.scene.add(rackGroup);
+    this.racks.set(rackId, rackGroup);
+  }
+
+  private removeBatteryRack(rackId: string): void {
+    const rackGroup = this.racks.get(rackId);
+    if (!rackGroup) return;
+    for (let i = 1; i <= 4; i++) {
+      this.removeBattery(`${rackId}-battery-${i}`);
+    }
+    rackGroup.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.geometry?.dispose();
+        (obj.material as THREE.Material)?.dispose();
+      } else if (obj instanceof THREE.Line) {
+        obj.geometry?.dispose();
+        (obj.material as THREE.Material)?.dispose();
+      }
+    });
+    this.scene.remove(rackGroup);
+    this.racks.delete(rackId);
+  }
+
+  private updateBatteryColors(id: string, charge: number): void {
+    const bat = this.batteries.get(id);
+    if (!bat) return;
+    const { planes } = bat;
+    bat.charge = charge;
+    for (let i = 0; i < planes.length; i++) {
+      const mesh = planes[i];
+      const mat = mesh.material as THREE.MeshStandardMaterial;
+      const threshold = (i + 1) * (100 / BATTERY_SEGMENTS);
+      const isGreen = charge >= threshold;
+      mat.emissive.setHex(isGreen ? 0x00ff00 : 0xff0000);
+      mat.color.setHex(isGreen ? 0x002200 : 0x330000);
+    }
+  }
+
+  private setBatteryCharge(id: string, charge: number): void {
+    const bat = this.batteries.get(id);
+    if (!bat) return;
+    this.updateBatteryColors(id, Math.max(0, Math.min(100, charge)));
+  }
+
+  private removeBattery(id: string): void {
+    const bat = this.batteries.get(id);
+    if (!bat) return;
+    this.scene.remove(bat.group);
+    bat.planes.forEach((mesh) => {
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+    });
+    this.batteries.delete(id);
+  }
+
+  private static readonly BLINK_YELLOW = new THREE.Color(0xffff00);
+  private static readonly BLINK_RED = new THREE.Color(0xff0000);
+  private readonly blinkLerpColor = new THREE.Color();
+
+  private updateBatteryBlink(elapsed: number): void {
+    const t = (elapsed % BATTERY_BLINK_CYCLE) / BATTERY_BLINK_CYCLE;
+    const smooth = 0.5 - 0.5 * Math.cos(t * Math.PI * 2);
+    this.blinkLerpColor.lerpColors(
+      Scene.BLINK_YELLOW,
+      Scene.BLINK_RED,
+      smooth
+    );
+    const emissiveHex = this.blinkLerpColor.getHex();
+    this.batteries.forEach((bat) => {
+      if (bat.charge > 0) return;
+      bat.planes.forEach((mesh) => {
+        const mat = mesh.material as THREE.MeshStandardMaterial;
+        mat.emissive.setHex(emissiveHex);
+        mat.emissiveIntensity = 1;
+      });
+    });
   }
 
   private onKeyDown(event: KeyboardEvent): void {
@@ -571,6 +797,39 @@ export class Scene {
       }
       return;
     }
+
+    // Hover displayName: ShinyPath, buggy, and other map objects.
+    if (this.pfOptions?.onHoverInfoChange) {
+      const roots: THREE.Object3D[] = [];
+      if (this.shinyPathGroup) roots.push(this.shinyPathGroup);
+      if (this.buggyGroup) roots.push(this.buggyGroup);
+      if (roots.length > 0) {
+        this.raycaster.setFromCamera(this.pointer, this.camera);
+        const hits = this.raycaster.intersectObjects(roots, true);
+        let label: string | null = null;
+        if (hits.length > 0) {
+          let obj: THREE.Object3D | null = hits[0].object;
+          while (obj && !label) {
+            const u = (obj as THREE.Object3D & { userData?: Record<string, unknown> }).userData;
+            if (u && typeof u.displayName === 'string') {
+              label = u.displayName as string;
+              break;
+            }
+            obj = obj.parent;
+          }
+        }
+        if (label) {
+          this.pfOptions.onHoverInfoChange({
+            label,
+            screenX: event.clientX,
+            screenY: event.clientY,
+          });
+        } else {
+          this.pfOptions.onHoverInfoChange(null);
+        }
+      }
+    }
+
     if (!this.tooltipEl || this.pfOptions?.getPFEnabled()) return;
     this.raycaster.setFromCamera(this.pointer, this.camera);
     const hits = this.raycaster.intersectObject(this.markerSphere, false);
@@ -665,6 +924,7 @@ export class Scene {
           layoutVeh?.position[1] ?? 0,
           layoutVeh?.position[2] ?? 0
         );
+        this.referenceVehicleGroup.visible = false;
         this.scene.add(this.referenceVehicleGroup);
       },
       undefined,
@@ -677,6 +937,91 @@ export class Scene {
           );
         } else {
           console.error('Failed to load ReferenceVehicle_01.glb:', err);
+        }
+      }
+    );
+  }
+
+  private loadShinyPath(): void {
+    if (this.disposed) return;
+    const loader = new GLTFLoader();
+    loader.load(
+      '/models/ShinyPath_04.glb',
+      (gltf) => {
+        if (this.disposed) {
+          gltf.scene.traverse((obj) => {
+            if (obj instanceof THREE.Mesh) {
+              obj.geometry?.dispose();
+              if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+              else obj.material?.dispose();
+            }
+          });
+          return;
+        }
+        this.shinyPathGroup = gltf.scene;
+        this.shinyPathGroup.position.set(0, 0, 0);
+        this.scene.add(this.shinyPathGroup);
+        // Compute map extents and adjust initial camera distance and clamp.
+        const box = new THREE.Box3().setFromObject(this.shinyPathGroup);
+        const center = box.getCenter(new THREE.Vector3());
+        const halfX = (box.max.x - box.min.x) / 2;
+        const halfZ = (box.max.z - box.min.z) / 2;
+        this.mapHalfExtent = Math.max(halfX, halfZ);
+        this.orbitControls.target.set(center.x, 0, center.z);
+        if (this.camera instanceof THREE.PerspectiveCamera) {
+          const fovRad = (this.camera.fov * Math.PI) / 180;
+          const dist = this.mapHalfExtent / Math.tan(fovRad / 2);
+          this.camera.position.set(center.x, dist, center.z);
+          this.initialCameraDistance = dist;
+          if (this.pfOptions?.onCameraChange) {
+            this.pfOptions.onCameraChange(this.getCameraInfo());
+          }
+        }
+      },
+      undefined,
+      (err) => {
+        const msg = (err as Error)?.message ?? String(err);
+        if (msg.includes('<!DOCTYPE') || msg.includes('not valid JSON')) {
+          console.error(
+            'ShinyPath_04.glb not found: server returned HTML. Add frontend/public/models/ShinyPath_04.glb'
+          );
+        } else {
+          console.error('Failed to load ShinyPath_04.glb:', err);
+        }
+      }
+    );
+  }
+
+  private loadBuggy(): void {
+    if (this.disposed) return;
+    const loader = new GLTFLoader();
+    loader.load(
+      '/models/LoadedBuggy_04.glb',
+      (gltf) => {
+        if (this.disposed) {
+          gltf.scene.traverse((obj) => {
+            if (obj instanceof THREE.Mesh) {
+              obj.geometry?.dispose();
+              if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+              else obj.material?.dispose();
+            }
+          });
+          return;
+        }
+        this.buggyGroup = gltf.scene;
+        // Slightly above the ShinyPath surface, centered in the map.
+        this.buggyGroup.position.set(0, 0.1, 0);
+        this.scene.add(this.buggyGroup);
+      },
+      undefined,
+      (err) => {
+        const msg = (err as Error)?.message ?? String(err);
+        if (msg.includes('<!DOCTYPE') || msg.includes('not valid JSON')) {
+          console.error(
+            'LoadedBuggy_04.glb not found: server returned HTML. Add frontend/public/models/LoadedBuggy_04.glb'
+          );
+        } else {
+          console.error('Failed to load LoadedBuggy_04.glb:', err);
         }
       }
     );
@@ -883,21 +1228,72 @@ export class Scene {
       this.orbitControls.addEventListener('change', this.boundOnOrbitChange);
       this.pfOptions.onCameraChange(this.getCameraInfo());
     }
+    if (this.pfOptions?.batteryApiRef) {
+      this.pfOptions.batteryApiRef.current = {
+        createBattery: this.createBattery.bind(this),
+        setBatteryCharge: this.setBatteryCharge.bind(this),
+        removeBattery: this.removeBattery.bind(this),
+        createBatteryRack: this.createBatteryRack.bind(this),
+        removeBatteryRack: this.removeBatteryRack.bind(this),
+      };
+    }
     this.loadAxisHelper();
     this.loadReferenceVehicle();
     this.loadRotationHelper();
+    this.loadShinyPath();
+    this.loadBuggy();
     const loop = () => {
       if (this.disposed) return;
       this.rafId = requestAnimationFrame(loop);
       const dt = this.clock.getDelta();
+      const pfOn = this.pfOptions?.getPFEnabled() ?? false;
       if (this.axisHelperGroup) {
-        const pfOn = this.pfOptions?.getPFEnabled() ?? false;
         this.axisHelperGroup.visible = pfOn && (this.gKeyPending || this.dragMode !== null);
       }
-      this.orbitControls.enabled = !(
-        this.pfOptions?.getPFEnabled() && this.selectedObject !== null
-      );
+      // Configure orbit controls based on PF and zoom level.
+      const dist = this.camera.position.distanceTo(this.orbitControls.target);
+      const zoomIsHigh =
+        this.initialCameraDistance > 0 &&
+        dist > this.initialCameraDistance * 0.9 &&
+        dist < this.initialCameraDistance * 1.1;
+      if (!pfOn) {
+        // PF off: no rotate/zoom. Pan only when zoomed in (Med/Low).
+        this.orbitControls.enableRotate = false;
+        this.orbitControls.enableZoom = false;
+        this.orbitControls.enablePan = !zoomIsHigh;
+      } else {
+        // PF on: full orbit controls.
+        this.orbitControls.enableRotate = true;
+        this.orbitControls.enableZoom = true;
+        this.orbitControls.enablePan = true;
+      }
+      this.orbitControls.enabled = !(pfOn && this.selectedObject !== null);
       this.orbitControls.update();
+      // Clamp panning (PF off) so the ShinyPath map stays in view and
+      // never shows black border on top/bottom, or more black on the sides
+      // than is necessary to keep the full map visible at the current zoom.
+      if (!pfOn && this.camera instanceof THREE.PerspectiveCamera) {
+        const M = this.mapHalfExtent;
+        const fovRad = (this.camera.fov * Math.PI) / 180;
+        const dist = this.camera.position.distanceTo(this.orbitControls.target);
+        const halfWidth = dist * Math.tan(fovRad / 2);
+        // When zoomed in (halfWidth < M), require the entire map to remain
+        // inside the frustum: the target can move at most (M - halfWidth)
+        // from the center without revealing black space.
+        const maxOffset = Math.max(0, M - halfWidth);
+        const tx = this.orbitControls.target.x;
+        const tz = this.orbitControls.target.z;
+        const clampedX = Math.min(Math.max(tx, -maxOffset), maxOffset);
+        const clampedZ = Math.min(Math.max(tz, -maxOffset), maxOffset);
+        const dx = clampedX - tx;
+        const dz = clampedZ - tz;
+        if (dx !== 0 || dz !== 0) {
+          this.orbitControls.target.x += dx;
+          this.orbitControls.target.z += dz;
+          this.camera.position.x += dx;
+          this.camera.position.z += dz;
+        }
+      }
       // Steer and move vehicle on XZ plane
       if (this.referenceVehicleGroup) {
         if (this.keysPressed.has('a')) this.referenceVehicleGroup.rotation.y += STEER_SPEED * dt;
@@ -914,6 +1310,7 @@ export class Scene {
       const t = this.clock.getElapsedTime();
       this.cubeMesh.rotation.x = t * 0.2;
       this.cubeMesh.rotation.y = t * 0.3;
+      this.updateBatteryBlink(t);
       this.renderer.render(this.scene, this.camera);
     };
     loop();
@@ -936,6 +1333,9 @@ export class Scene {
     if (this.pfOptions?.setRotationRef) this.pfOptions.setRotationRef.current = null;
     if (this.pfOptions?.setScaleRef) this.pfOptions.setScaleRef.current = null;
     if (this.pfOptions?.setCameraRef) this.pfOptions.setCameraRef.current = null;
+    if (this.pfOptions?.batteryApiRef) this.pfOptions.batteryApiRef.current = null;
+    Array.from(this.racks.keys()).forEach((id) => this.removeBatteryRack(id));
+    Array.from(this.batteries.keys()).forEach((id) => this.removeBattery(id));
     if (this.pfOptions?.onCameraChange) {
       this.orbitControls.removeEventListener('change', this.boundOnOrbitChange);
     }
