@@ -143,6 +143,7 @@ function App() {
       position: [nx, ny, nz],
       target: [tx, ty, tz],
     });
+    batteryApiRef.current?.refreshBatteryMaterials?.();
   };
 
   useEffect(() => {
@@ -291,18 +292,21 @@ function App() {
   const allBatteriesInOrder = useMemo(() => getAllBatteriesInOrder(), []);
   const BATTERY_DRAIN_SEC = 30;
 
-  // Drain IceMine1Pad1 rack (IceMine1Hrack) so all 4 batteries show red
+  // On load: fully charge all batteries, then fully drain GreenHouse2Hrack. Re-run for a few seconds so we catch racks created asynchronously (so 0% and blink apply).
   useEffect(() => {
-    const rackId = 'battery-rack-IceMine1Hrack';
-    const drain = () => {
+    const apply = () => {
       const api = batteryApiRef.current;
-      if (!api) return false;
-      for (let i = 1; i <= 4; i++) api.setBatteryCharge(`${rackId}-battery-${i}`, 0);
-      return true;
+      if (!api) return;
+      for (const pad of PAD_CONFIG) {
+        const rackId = `battery-rack-${pad.id}`;
+        for (let i = 1; i <= 4; i++) api.setBatteryCharge(`${rackId}-battery-${i}`, 100);
+      }
+      for (let i = 1; i <= 4; i++) api.setBatteryCharge(`battery-rack-GreenHouse2Hrack-battery-${i}`, 0);
     };
-    if (drain()) return;
-    const t = setInterval(() => { if (drain()) clearInterval(t); }, 100);
-    return () => clearInterval(t);
+    apply();
+    const t = setInterval(apply, 200);
+    const stop = setTimeout(() => clearInterval(t), 3000);
+    return () => { clearInterval(t); clearTimeout(stop); };
   }, []);
 
   const simulationRafRef = useRef<number>(0);

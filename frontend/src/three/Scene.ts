@@ -98,6 +98,8 @@ export type BatteryApi = {
   ) => void;
   removeBatteryRack: (rackId: string) => void;
   setFacilityFailed: (facilityId: string, failed: boolean) => void;
+  /** Re-apply battery colors (fixes black draw after zoom/camera change). */
+  refreshBatteryMaterials: () => void;
 };
 
 export type PlacementFacilityOptions = {
@@ -276,12 +278,13 @@ export class Scene {
     const segH = segW / BATTERY_SEGMENTS;
     for (let i = 0; i < BATTERY_SEGMENTS; i++) {
       const geom = new THREE.PlaneGeometry(segW, segH);
-      const mat = new THREE.MeshStandardMaterial({
-        color: 0x333333,
-        emissive: 0xff0000,
-        emissiveIntensity: 0.6,
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xff0000,
+        depthTest: false,
+        depthWrite: false,
       });
       const mesh = new THREE.Mesh(geom, mat);
+      mesh.renderOrder = 10;
       mesh.position.y = (i + 0.5) * segH - segW / 2;
       group.add(mesh);
       planes.push(mesh);
@@ -441,11 +444,10 @@ export class Scene {
     bat.charge = charge;
     for (let i = 0; i < planes.length; i++) {
       const mesh = planes[i];
-      const mat = mesh.material as THREE.MeshStandardMaterial;
+      const mat = mesh.material as THREE.MeshBasicMaterial;
       const threshold = (i + 1) * (100 / BATTERY_SEGMENTS);
       const isGreen = charge >= threshold;
-      mat.emissive.setHex(isGreen ? 0x00ff00 : 0xff0000);
-      mat.color.setHex(isGreen ? 0x002200 : 0x330000);
+      mat.color.setHex(isGreen ? 0x00ff00 : 0xff0000);
     }
   }
 
@@ -478,14 +480,19 @@ export class Scene {
       Scene.BLINK_RED,
       smooth
     );
-    const emissiveHex = this.blinkLerpColor.getHex();
+    const blinkHex = this.blinkLerpColor.getHex();
     this.batteries.forEach((bat) => {
       if (bat.charge > 0) return;
       bat.planes.forEach((mesh) => {
-        const mat = mesh.material as THREE.MeshStandardMaterial;
-        mat.emissive.setHex(emissiveHex);
-        mat.emissiveIntensity = 1;
+        const mat = mesh.material as THREE.MeshBasicMaterial;
+        mat.color.setHex(blinkHex);
       });
+    });
+  }
+
+  private refreshBatteryMaterials(): void {
+    this.batteries.forEach((bat, id) => {
+      this.updateBatteryColors(id, bat.charge);
     });
   }
 
@@ -851,7 +858,7 @@ export class Scene {
       return;
     }
 
-    // Hover: show up to 2 closest hit labels in one popup (racks + displayName from map objects).
+    // Hover: show the first (closest) hit label only (rack or displayName from map objects).
     if (this.pfOptions?.onHoverInfoChange) {
       const roots: THREE.Object3D[] = [];
       if (this.shinyPathGroup) roots.push(this.shinyPathGroup);
@@ -862,35 +869,29 @@ export class Scene {
       } else {
         this.raycaster.setFromCamera(this.pointer, this.camera);
         const hits = this.raycaster.intersectObjects(roots, true);
-        const labels: string[] = [];
-        const maxHits = Math.min(2, hits.length);
-        for (let i = 0; i < maxHits; i++) {
-          let obj: THREE.Object3D | null = hits[i].object;
-          let found = false;
-          while (obj && !found) {
+        let label: string | null = null;
+        if (hits.length > 0) {
+          let obj: THREE.Object3D | null = hits[0].object;
+          while (obj) {
             for (const [id, group] of this.racks) {
               if (group === obj) {
-                const shortName = id.startsWith('battery-rack-') ? id.slice('battery-rack-'.length) : id;
-                labels.push(shortName);
-                found = true;
+                label = id.startsWith('battery-rack-') ? id.slice('battery-rack-'.length) : id;
                 break;
               }
             }
-            if (!found) {
-              const u = (obj as THREE.Object3D & { userData?: Record<string, unknown> }).userData;
-              if (u && typeof u.displayName === 'string') {
-                labels.push(u.displayName as string);
-                found = true;
-                break;
-              }
-              obj = obj.parent;
+            if (label) break;
+            const u = (obj as THREE.Object3D & { userData?: Record<string, unknown> }).userData;
+            if (u && typeof u.displayName === 'string') {
+              label = u.displayName as string;
+              break;
             }
+            obj = obj.parent;
           }
-          if (!found) labels.push('(object)');
+          if (!label) label = '(object)';
         }
-        if (labels.length > 0) {
+        if (label) {
           this.pfOptions.onHoverInfoChange({
-            label: labels.join('\n'),
+            label,
             screenX: event.clientX,
             screenY: event.clientY,
           });
@@ -1306,6 +1307,7 @@ export class Scene {
         createBatteryRack: this.createBatteryRack.bind(this),
         removeBatteryRack: this.removeBatteryRack.bind(this),
         setFacilityFailed: this.setFacilityFailed.bind(this),
+        refreshBatteryMaterials: this.refreshBatteryMaterials.bind(this),
       };
     }
     this.loadAxisHelper();
