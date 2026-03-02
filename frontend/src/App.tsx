@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import {
   Scene,
   type SelectedObjectInfo,
@@ -7,6 +7,10 @@ import {
   type HoverInfo,
 } from './three/Scene';
 import { BatteryRack } from './BatteryRack';
+import {
+  PAD_CONFIG,
+  getAllBatteriesInOrder,
+} from './padConfig';
 
 const API_BASE = '';
 
@@ -60,6 +64,8 @@ function App() {
   const setCameraRef = useRef<((params: CameraParams) => void) | null>(null);
   const batteryApiRef = useRef<import('./three/Scene').BatteryApi | null>(null);
   const [hoverInfo, setHoverInfo] = useState<HoverInfo>(null);
+  const [simulationRunning, setSimulationRunning] = useState(false);
+  const simulationStartTimeRef = useRef<number>(0);
   pfEnabledRef.current = placementFacilityOn;
 
   const onColorChange = useCallback((currentColor: string, nextColor: string) => {
@@ -282,6 +288,59 @@ function App() {
     setCameraRef.current?.(params);
   };
 
+  const allBatteriesInOrder = useMemo(() => getAllBatteriesInOrder(), []);
+  const BATTERY_DRAIN_SEC = 30;
+
+  // Drain IceMine1Pad1 rack (IceMine1Hrack) so all 4 batteries show red
+  useEffect(() => {
+    const rackId = 'battery-rack-IceMine1Hrack';
+    const drain = () => {
+      const api = batteryApiRef.current;
+      if (!api) return false;
+      for (let i = 1; i <= 4; i++) api.setBatteryCharge(`${rackId}-battery-${i}`, 0);
+      return true;
+    };
+    if (drain()) return;
+    const t = setInterval(() => { if (drain()) clearInterval(t); }, 100);
+    return () => clearInterval(t);
+  }, []);
+
+  const simulationRafRef = useRef<number>(0);
+  useEffect(() => {
+    if (!simulationRunning || !batteryApiRef.current) return;
+    simulationStartTimeRef.current = Date.now();
+    let lastIndex = -1;
+    const tick = () => {
+      if (!batteryApiRef.current) return;
+      const elapsed = (Date.now() - simulationStartTimeRef.current) / 1000;
+      const currentIndex = Math.floor(elapsed / BATTERY_DRAIN_SEC);
+      const chargeCurrent =
+        currentIndex < allBatteriesInOrder.length
+          ? Math.max(0, 100 * (1 - (elapsed % BATTERY_DRAIN_SEC) / BATTERY_DRAIN_SEC))
+          : 0;
+      for (let i = 0; i < allBatteriesInOrder.length; i++) {
+        const c = i < currentIndex ? 0 : i === currentIndex ? chargeCurrent : 100;
+        batteryApiRef.current.setBatteryCharge(allBatteriesInOrder[i].batteryId, c);
+      }
+      if (currentIndex > lastIndex && lastIndex >= 0 && lastIndex < allBatteriesInOrder.length) {
+        const { facilityId } = allBatteriesInOrder[lastIndex];
+        const nextFacility =
+          currentIndex < allBatteriesInOrder.length
+            ? allBatteriesInOrder[currentIndex].facilityId
+            : null;
+        if (nextFacility !== facilityId) {
+          batteryApiRef.current.setFacilityFailed(facilityId, true);
+        }
+      }
+      lastIndex = currentIndex;
+      if (currentIndex < allBatteriesInOrder.length) {
+        simulationRafRef.current = requestAnimationFrame(tick);
+      }
+    };
+    simulationRafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(simulationRafRef.current);
+  }, [simulationRunning, allBatteriesInOrder]);
+
   const inputStyle: React.CSSProperties = {
     width: 56,
     padding: '4px 6px',
@@ -296,8 +355,17 @@ function App() {
   return (
     <>
       <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
-      {/* Battery rack on the map surface, near the top edge of the ShinyPath. */}
-      <BatteryRack index={0} apiRef={batteryApiRef} position={[0, 0.05, 8.5]} />
+      {/* Racks on each pad (hrack/vrack by pad orientation). Batteries represent power per location. */}
+      {PAD_CONFIG.map((pad) => (
+        <BatteryRack
+          key={pad.id}
+          id={pad.id}
+          apiRef={batteryApiRef}
+          position={pad.position}
+          orientation={pad.orientation}
+          initialCharges={pad.initialCharges}
+        />
+      ))}
       {hoverInfo && (
         <div
           style={{
@@ -364,6 +432,25 @@ function App() {
             </button>
           );
         })}
+        {placementFacilityOn && (
+          <button
+            type="button"
+            onClick={() => setSimulationRunning(true)}
+            disabled={simulationRunning}
+            style={{
+              padding: '4px 10px',
+              fontSize: 12,
+              borderRadius: 4,
+              border: '1px solid #555',
+              background: simulationRunning ? '#333' : '#444',
+              color: '#eee',
+              cursor: simulationRunning ? 'default' : 'pointer',
+              marginTop: 4,
+            }}
+          >
+            {simulationRunning ? 'Simulation running…' : 'Start simulation'}
+          </button>
+        )}
         <button
           type="button"
           style={{

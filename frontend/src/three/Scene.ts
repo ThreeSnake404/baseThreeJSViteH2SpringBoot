@@ -3,6 +3,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { createRenderer } from './core/Renderer';
 import { setupResize } from './core/ResizeHandler';
+import { FACILITY_CENTERS } from '../padConfig';
 
 /** Radians per second when steering left/right on the XZ plane. */
 const STEER_SPEED = 1.2;
@@ -92,9 +93,11 @@ export type BatteryApi = {
   createBatteryRack: (
     rackId: string,
     position?: [number, number, number],
-    initialCharges?: number[]
+    initialCharges?: number[],
+    orientation?: 'hrack' | 'vrack'
   ) => void;
   removeBatteryRack: (rackId: string) => void;
+  setFacilityFailed: (facilityId: string, failed: boolean) => void;
 };
 
 export type PlacementFacilityOptions = {
@@ -157,6 +160,7 @@ export class Scene {
     { group: THREE.Group; planes: THREE.Mesh[]; charge: number }
   >();
   private readonly racks = new Map<string, THREE.Group>();
+  private readonly facilityFailureOverlays = new Map<string, THREE.Group>();
   private mapHalfExtent = 10;
   private readonly dragPlane = new THREE.Plane();
   private readonly dragPlaneNormal = new THREE.Vector3();
@@ -312,9 +316,15 @@ export class Scene {
   private createBatteryRack(
     rackId: string,
     position?: [number, number, number],
-    initialCharges?: number[]
+    initialCharges?: number[],
+    orientation: 'hrack' | 'vrack' = 'hrack'
   ): void {
-    if (this.racks.has(rackId)) return;
+    const existing = this.racks.get(rackId);
+    if (existing) {
+      if (position) existing.position.set(position[0], position[1], position[2]);
+      existing.rotation.y = orientation === 'vrack' ? Math.PI / 2 : 0;
+      return;
+    }
     const rackGroup = new THREE.Group();
     rackGroup.name = rackId;
     if (position) rackGroup.position.set(position[0], position[1], position[2]);
@@ -347,14 +357,15 @@ export class Scene {
 
     for (let i = 0; i < 4; i++) {
       const batId = `${rackId}-battery-${i + 1}`;
-      this.createBattery(
-        batId,
-        [RACK_BATTERY_X_OFFSETS[i], 0, 0],
-        rackGroup
-      );
+      const pos: [number, number, number] = [RACK_BATTERY_X_OFFSETS[i], 0, 0];
+      this.createBattery(batId, pos, rackGroup);
       if (initialCharges && initialCharges[i] !== undefined) {
         this.setBatteryCharge(batId, initialCharges[i]);
       }
+    }
+
+    if (orientation === 'vrack') {
+      rackGroup.rotation.y = Math.PI / 2;
     }
 
     rackGroup.scale.set(0.25, 0.25, 0.25);
@@ -379,6 +390,48 @@ export class Scene {
     });
     this.scene.remove(rackGroup);
     this.racks.delete(rackId);
+  }
+
+  private createFacilityFailureOverlay(facilityId: string): THREE.Group {
+    const center = FACILITY_CENTERS[facilityId];
+    if (!center) {
+      const g = new THREE.Group();
+      g.visible = false;
+      return g;
+    }
+    const group = new THREE.Group();
+    group.position.set(center[0], center[1], center[2]);
+    const barLength = 2.5;
+    const barWidth = 0.2;
+    const barHeight = 0.08;
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x660000,
+      emissive: 0xff0000,
+      emissiveIntensity: 1,
+    });
+    const bar1 = new THREE.Mesh(
+      new THREE.BoxGeometry(barLength, barHeight, barWidth),
+      mat.clone()
+    );
+    const bar2 = new THREE.Mesh(
+      new THREE.BoxGeometry(barWidth, barHeight, barLength),
+      mat.clone()
+    );
+    group.add(bar1);
+    group.add(bar2);
+    group.rotation.y = Math.PI / 4;
+    group.userData.facilityId = facilityId;
+    this.scene.add(group);
+    return group;
+  }
+
+  private setFacilityFailed(facilityId: string, failed: boolean): void {
+    let overlay = this.facilityFailureOverlays.get(facilityId);
+    if (!overlay) {
+      overlay = this.createFacilityFailureOverlay(facilityId);
+      this.facilityFailureOverlays.set(facilityId, overlay);
+    }
+    overlay.visible = failed;
   }
 
   private updateBatteryColors(id: string, charge: number): void {
@@ -798,29 +851,46 @@ export class Scene {
       return;
     }
 
-    // Hover displayName: ShinyPath, buggy, and other map objects.
+    // Hover: show up to 2 closest hit labels in one popup (racks + displayName from map objects).
     if (this.pfOptions?.onHoverInfoChange) {
       const roots: THREE.Object3D[] = [];
       if (this.shinyPathGroup) roots.push(this.shinyPathGroup);
       if (this.buggyGroup) roots.push(this.buggyGroup);
-      if (roots.length > 0) {
+      this.racks.forEach((group) => roots.push(group));
+      if (roots.length === 0) {
+        this.pfOptions.onHoverInfoChange(null);
+      } else {
         this.raycaster.setFromCamera(this.pointer, this.camera);
         const hits = this.raycaster.intersectObjects(roots, true);
-        let label: string | null = null;
-        if (hits.length > 0) {
-          let obj: THREE.Object3D | null = hits[0].object;
-          while (obj && !label) {
-            const u = (obj as THREE.Object3D & { userData?: Record<string, unknown> }).userData;
-            if (u && typeof u.displayName === 'string') {
-              label = u.displayName as string;
-              break;
+        const labels: string[] = [];
+        const maxHits = Math.min(2, hits.length);
+        for (let i = 0; i < maxHits; i++) {
+          let obj: THREE.Object3D | null = hits[i].object;
+          let found = false;
+          while (obj && !found) {
+            for (const [id, group] of this.racks) {
+              if (group === obj) {
+                const shortName = id.startsWith('battery-rack-') ? id.slice('battery-rack-'.length) : id;
+                labels.push(shortName);
+                found = true;
+                break;
+              }
             }
-            obj = obj.parent;
+            if (!found) {
+              const u = (obj as THREE.Object3D & { userData?: Record<string, unknown> }).userData;
+              if (u && typeof u.displayName === 'string') {
+                labels.push(u.displayName as string);
+                found = true;
+                break;
+              }
+              obj = obj.parent;
+            }
           }
+          if (!found) labels.push('(object)');
         }
-        if (label) {
+        if (labels.length > 0) {
           this.pfOptions.onHoverInfoChange({
-            label,
+            label: labels.join('\n'),
             screenX: event.clientX,
             screenY: event.clientY,
           });
@@ -1235,6 +1305,7 @@ export class Scene {
         removeBattery: this.removeBattery.bind(this),
         createBatteryRack: this.createBatteryRack.bind(this),
         removeBatteryRack: this.removeBatteryRack.bind(this),
+        setFacilityFailed: this.setFacilityFailed.bind(this),
       };
     }
     this.loadAxisHelper();
@@ -1335,6 +1406,16 @@ export class Scene {
     if (this.pfOptions?.setCameraRef) this.pfOptions.setCameraRef.current = null;
     if (this.pfOptions?.batteryApiRef) this.pfOptions.batteryApiRef.current = null;
     Array.from(this.racks.keys()).forEach((id) => this.removeBatteryRack(id));
+    this.facilityFailureOverlays.forEach((group) => {
+      group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.geometry?.dispose();
+          (obj.material as THREE.Material)?.dispose();
+        }
+      });
+      this.scene.remove(group);
+    });
+    this.facilityFailureOverlays.clear();
     Array.from(this.batteries.keys()).forEach((id) => this.removeBattery(id));
     if (this.pfOptions?.onCameraChange) {
       this.orbitControls.removeEventListener('change', this.boundOnOrbitChange);
