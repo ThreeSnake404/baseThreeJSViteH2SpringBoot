@@ -134,7 +134,7 @@ export class Scene {
   private axisHelperGroup: THREE.Group | null = null;
   private referenceVehicleGroup: THREE.Group | null = null;
   private shinyPathGroup: THREE.Group | null = null;
-  private buggyGroup: THREE.Group | null = null;
+  private readonly buggies = new Map<string, THREE.Group>();
   private colorIndex = 0;
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointer = new THREE.Vector2();
@@ -585,6 +585,7 @@ export class Scene {
   private getSelectableRoots(): THREE.Object3D[] {
     const roots: THREE.Object3D[] = [];
     if (this.referenceVehicleGroup) roots.push(this.referenceVehicleGroup);
+    this.buggies.forEach((g) => roots.push(g));
     return roots;
   }
 
@@ -862,7 +863,7 @@ export class Scene {
     if (this.pfOptions?.onHoverInfoChange) {
       const roots: THREE.Object3D[] = [];
       if (this.shinyPathGroup) roots.push(this.shinyPathGroup);
-      if (this.buggyGroup) roots.push(this.buggyGroup);
+      this.buggies.forEach((group) => roots.push(group));
       this.racks.forEach((group) => roots.push(group));
       if (roots.length === 0) {
         this.pfOptions.onHoverInfoChange(null);
@@ -1032,6 +1033,10 @@ export class Scene {
         this.shinyPathGroup = gltf.scene;
         this.shinyPathGroup.position.set(0, 0, 0);
         this.scene.add(this.shinyPathGroup);
+        this.buggies.forEach((buggy, id) => {
+          const padName = (id === 'bug1' ? 'VehicleBayPad1' : id === 'bug2' ? 'VehicleBayPad2' : id === 'bug3' ? 'VehicleBayPad3' : 'VehicleBayPad4');
+          this.positionBuggyOnPad(padName, buggy);
+        });
         // Compute map extents and adjust initial camera distance and clamp.
         const box = new THREE.Box3().setFromObject(this.shinyPathGroup);
         const center = box.getCenter(new THREE.Vector3());
@@ -1063,6 +1068,24 @@ export class Scene {
     );
   }
 
+  /** Find pad by name or displayName in ShinyPath and set buggy position to its world position (y + 0.1). */
+  private positionBuggyOnPad(padName: string, buggy: THREE.Group): void {
+    if (!this.shinyPathGroup) return;
+    let pad: THREE.Object3D | null = null;
+    this.shinyPathGroup.traverse((obj) => {
+      if (pad) return;
+      const name = (obj as THREE.Object3D & { userData?: { displayName?: string } }).userData?.displayName ?? obj.name;
+      if (name === padName) pad = obj;
+    });
+    if (!pad) {
+      buggy.position.set(0, 0.1, 0);
+      return;
+    }
+    const box = new THREE.Box3().setFromObject(pad);
+    const center = box.getCenter(this.tempVec3);
+    buggy.position.set(center.x, center.y + 0.1, center.z);
+  }
+
   private loadBuggy(): void {
     if (this.disposed) return;
     const loader = new GLTFLoader();
@@ -1079,10 +1102,19 @@ export class Scene {
           });
           return;
         }
-        this.buggyGroup = gltf.scene;
-        // Slightly above the ShinyPath surface, centered in the map.
-        this.buggyGroup.position.set(0, 0.1, 0);
-        this.scene.add(this.buggyGroup);
+        const BUGGY_PADS = ['VehicleBayPad1', 'VehicleBayPad2', 'VehicleBayPad3', 'VehicleBayPad4'] as const;
+        const buggyIds = ['bug1', 'bug2', 'bug3', 'bug4'] as const;
+        const buggyRotations = [Math.PI / 2, Math.PI / 2, 0, 0]; // bug1,bug2: 90° left; bug3,bug4: 180° from that (facing the other way)
+        for (let i = 0; i < 4; i++) {
+          const group = i === 0 ? gltf.scene : gltf.scene.clone(true);
+          group.name = buggyIds[i];
+          group.userData.displayName = buggyIds[i];
+          group.scale.setScalar(2);
+          group.rotation.y = buggyRotations[i];
+          this.positionBuggyOnPad(BUGGY_PADS[i], group);
+          this.scene.add(group);
+          this.buggies.set(buggyIds[i], group);
+        }
       },
       undefined,
       (err) => {
