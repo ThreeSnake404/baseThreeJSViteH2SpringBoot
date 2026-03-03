@@ -15,6 +15,11 @@ import {
 
 const API_BASE = '';
 
+const MIN_WINDOW_WIDTH = 1157;
+const MIN_WINDOW_HEIGHT = 587;
+
+type CrewId = 'bowman' | 'poole' | 'kimball' | 'hal';
+
 const radToDeg = (rad: number): number => (rad * 180) / Math.PI;
 const degToRad = (deg: number): number => (deg * Math.PI) / 180;
 
@@ -69,6 +74,63 @@ function App() {
   const simulationStartTimeRef = useRef<number>(0);
   const [dockParams, setDockParams] = useState<DockAtPadParams | null>(null);
   const [dockLoadYes, setDockLoadYes] = useState<boolean | null>(null);
+  const [selectedCrew, setSelectedCrew] = useState<CrewId>('bowman');
+  const [manualOn, setManualOn] = useState(false);
+  const [missions, setMissions] = useState<Record<CrewId, number>>({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
+  const [cellsDelivered, setCellsDelivered] = useState<Record<CrewId, number>>({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
+  const [windowSize, setWindowSize] = useState(() =>
+    typeof window !== 'undefined' ? { width: window.innerWidth, height: window.innerHeight } : { width: 0, height: 0 }
+  );
+  const [showSizeWarning, setShowSizeWarning] = useState(() =>
+    typeof window !== 'undefined' &&
+    (window.innerWidth < MIN_WINDOW_WIDTH || window.innerHeight < MIN_WINDOW_HEIGHT)
+  );
+  const wasBelowMinRef = useRef(
+    typeof window !== 'undefined' &&
+      (window.innerWidth < MIN_WINDOW_WIDTH || window.innerHeight < MIN_WINDOW_HEIGHT)
+  );
+  const relayoutTimeoutRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const onResize = () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      setWindowSize({ width: w, height: h });
+      if (w >= MIN_WINDOW_WIDTH && h >= MIN_WINDOW_HEIGHT) {
+        setShowSizeWarning(false);
+      } else {
+        setShowSizeWarning(true);
+      }
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  useEffect(() => {
+    const below = windowSize.width < MIN_WINDOW_WIDTH || windowSize.height < MIN_WINDOW_HEIGHT;
+    if (below) {
+      wasBelowMinRef.current = true;
+      if (relayoutTimeoutRef.current !== null && typeof window !== 'undefined') {
+        window.clearTimeout(relayoutTimeoutRef.current);
+        relayoutTimeoutRef.current = null;
+      }
+      return;
+    }
+    if (!wasBelowMinRef.current || typeof window === 'undefined') return;
+    if (relayoutTimeoutRef.current !== null) window.clearTimeout(relayoutTimeoutRef.current);
+    relayoutTimeoutRef.current = window.setTimeout(() => {
+      window.location.reload();
+    }, 500);
+    return () => {
+      if (relayoutTimeoutRef.current !== null && typeof window !== 'undefined') {
+        window.clearTimeout(relayoutTimeoutRef.current);
+        relayoutTimeoutRef.current = null;
+      }
+    };
+  }, [windowSize.width, windowSize.height]);
+  useEffect(() => {
+    if (typeof window !== 'undefined') window.resizeTo(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT);
+  }, []);
   const dockOnAnswerRef = useRef<((loadYes: boolean, acceptYes: boolean) => void) | null>(null);
   pfEnabledRef.current = placementFacilityOn;
 
@@ -346,6 +408,78 @@ function App() {
 
   return (
     <>
+      {showSizeWarning && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.7)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 4000,
+          }}
+        >
+          <div
+            style={{
+              background: '#2a2a2a',
+              border: '1px solid #555',
+              borderRadius: 8,
+              padding: 24,
+              maxWidth: 400,
+              color: '#eee',
+              fontFamily: 'Courier, monospace',
+              fontSize: 14,
+              boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
+            }}
+          >
+            <p style={{ margin: '0 0 16px' }}>
+              This program looks better with a window size of at least {MIN_WINDOW_WIDTH}×{MIN_WINDOW_HEIGHT} pixels.
+            </p>
+            <p style={{ margin: '0 0 20px' }}>
+              Use the button below to open this app in a new window at {MIN_WINDOW_WIDTH}×{MIN_WINDOW_HEIGHT}. You can then close this tab. If you resize this window to at least that size, the display will update automatically.
+            </p>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                onClick={() => {
+                  window.open(
+                    window.location.href,
+                    '_blank',
+                    `width=${MIN_WINDOW_WIDTH},height=${MIN_WINDOW_HEIGHT},resizable=yes,scrollbars=yes`
+                  );
+                }}
+                style={{
+                  padding: '8px 16px',
+                  fontSize: 13,
+                  cursor: 'pointer',
+                  background: '#444',
+                  color: '#eee',
+                  border: '1px solid #555',
+                  borderRadius: 4,
+                }}
+              >
+                Open in New Window ({MIN_WINDOW_WIDTH}×{MIN_WINDOW_HEIGHT})
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSizeWarning(false)}
+                style={{
+                  padding: '8px 16px',
+                  fontSize: 13,
+                  cursor: 'pointer',
+                  background: '#444',
+                  color: '#eee',
+                  border: '1px solid #555',
+                  borderRadius: 4,
+                }}
+              >
+                OK (use this window)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
       {/* Racks on each pad (hrack/vrack by pad orientation). Batteries represent power per location. */}
       {PAD_CONFIG.map((pad) => (
@@ -469,54 +603,17 @@ function App() {
           </div>
         </div>
       )}
-      <div
-        style={{
-          position: 'absolute',
-          top: 60,
-          left: 12,
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 6,
-        }}
-      >
-        {(['high', 'med', 'low'] as const).map((level) => {
-          const label = level === 'high' ? 'High' : level === 'med' ? 'Med' : 'Low';
-          const onClick =
-            level === 'high'
-              ? () => {
-                  setZoomLevel('high');
-                  applyZoom(1);
-                }
-              : level === 'med'
-              ? () => {
-                  setZoomLevel('med');
-                  applyZoom(1 / 2);
-                }
-              : () => {
-                  setZoomLevel('low');
-                  applyZoom(1 / 4);
-                };
-          const active = zoomLevel === level;
-          return (
-            <button
-              key={level}
-              type="button"
-              onClick={onClick}
-              style={{
-                padding: '4px 10px',
-                fontSize: 12,
-                borderRadius: 4,
-                border: '1px solid #555',
-                background: active ? '#666' : '#444',
-                color: '#eee',
-                cursor: 'pointer',
-              }}
-            >
-              {label}
-            </button>
-          );
-        })}
-        {placementFacilityOn && (
+      {placementFacilityOn && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 60,
+            left: 12,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 6,
+          }}
+        >
           <button
             type="button"
             onClick={() => setSimulationRunning(true)}
@@ -529,53 +626,217 @@ function App() {
               background: simulationRunning ? '#333' : '#444',
               color: '#eee',
               cursor: simulationRunning ? 'default' : 'pointer',
-              marginTop: 4,
             }}
           >
             {simulationRunning ? 'Simulation running…' : 'Start simulation'}
           </button>
-        )}
-        <button
-          type="button"
-          style={{
-            padding: '4px 10px',
-            fontSize: 12,
-            borderRadius: 4,
-            border: '1px solid #555',
-            background: '#444',
-            color: '#eee',
-            cursor: 'pointer',
-          }}
-        >
-          Route
-        </button>
-        <button
-          type="button"
-          style={{
-            padding: '4px 10px',
-            fontSize: 12,
-            borderRadius: 4,
-            border: '1px solid #555',
-            background: '#444',
-            color: '#eee',
-            cursor: 'pointer',
-          }}
-        >
-          Manual
-        </button>
-      </div>
+        </div>
+      )}
       <div
         style={{
           position: 'absolute',
           top: 12,
           left: 12,
+          width: 240,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
           color: '#fff',
           textShadow: '0 0 4px #000',
           fontSize: 14,
+          fontFamily: 'Courier, monospace',
+          boxSizing: 'border-box',
         }}
       >
-        WebSocket: {wsStatus}
-        {placementFacilityOn && ' | Placement Facility ON'}
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+          }}
+        >
+          {(
+            [
+              { id: 'bowman' as CrewId, src: '/models/RedHelmetBR.png', alt: 'Bowman', label: 'Bowman' },
+              { id: 'poole' as CrewId, src: '/models/YellowHelmetBR.png', alt: 'Poole', label: 'Poole' },
+              { id: 'kimball' as CrewId, src: '/models/BlueHelmetBR.png', alt: 'Kimball', label: 'Kimball' },
+              { id: 'hal' as CrewId, src: '/models/EyeShot.png', alt: 'HAL 9000', label: 'HAL 9000' },
+            ] as const
+          ).map(({ id, src, alt, label }) => {
+            const connected = selectedCrew === id;
+            return (
+              <div
+                key={id}
+                style={{
+                  background: 'rgba(0,0,0,0.6)',
+                  border: '1px solid #555',
+                  borderRadius: 6,
+                  padding: 8,
+                  minWidth: 240,
+                  display: 'flex',
+                  flexDirection: 'row',
+                  gap: 12,
+                  alignItems: 'flex-start',
+                  fontFamily: 'Courier, monospace',
+                }}
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', flexShrink: 0 }}>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedCrew(id)}
+                    style={{
+                      padding: 4,
+                      borderRadius: 4,
+                      border: '1px solid #888',
+                      background: connected ? '#666' : '#222',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <img
+                      src={src}
+                      alt={alt}
+                      style={{ width: 64, height: 64, display: 'block' }}
+                    />
+                  </button>
+                  <span
+                    style={{
+                      marginTop: 4,
+                      fontSize: 11,
+                      color: connected ? '#0c0' : '#c00',
+                    }}
+                  >
+                    {connected ? 'Connected' : 'No Signal'}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{label}</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                    <span style={{ flex: 1, minWidth: 0 }}>Number of Missions:</span>
+                    <input
+                      type="text"
+                      readOnly
+                      value={missions[id]}
+                      style={{
+                        width: 36,
+                        flexShrink: 0,
+                        padding: '2px 4px',
+                        fontSize: 12,
+                        background: '#222',
+                        color: '#eee',
+                        border: '1px solid #444',
+                        borderRadius: 2,
+                        textAlign: 'right',
+                        fontFamily: 'Courier, monospace',
+                      }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                    <span style={{ flex: 1, minWidth: 0 }}>Most Cells Delivered:</span>
+                    <input
+                      type="text"
+                      readOnly
+                      value={cellsDelivered[id]}
+                      style={{
+                        width: 36,
+                        flexShrink: 0,
+                        padding: '2px 4px',
+                        fontSize: 12,
+                        background: '#222',
+                        color: '#eee',
+                        border: '1px solid #444',
+                        borderRadius: 2,
+                        textAlign: 'right',
+                        fontFamily: 'Courier, monospace',
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div
+          style={{
+            background: 'rgba(0,0,0,0.6)',
+            border: '1px solid #555',
+            borderRadius: 6,
+            padding: 8,
+            boxSizing: 'border-box',
+          }}
+        >
+          <div style={{ display: 'flex', flexDirection: 'row', gap: 6, alignItems: 'center' }}>
+            {(['high', 'med', 'low'] as const).map((level) => {
+              const label = level === 'high' ? 'High' : level === 'med' ? 'Med' : 'Low';
+              const onClick =
+                level === 'high'
+                  ? () => { setZoomLevel('high'); applyZoom(1); }
+                  : level === 'med'
+                  ? () => { setZoomLevel('med'); applyZoom(1 / 2); }
+                  : () => { setZoomLevel('low'); applyZoom(1 / 4); };
+              const active = zoomLevel === level;
+              return (
+                <button
+                  key={level}
+                  type="button"
+                  onClick={onClick}
+                  style={{
+                    padding: '4px 10px',
+                    fontSize: 12,
+                    borderRadius: 4,
+                    border: '1px solid #555',
+                    background: active ? '#666' : '#444',
+                    color: '#eee',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              onClick={() => setManualOn((v) => !v)}
+              style={{
+                padding: '4px 10px',
+                fontSize: 12,
+                borderRadius: 4,
+                border: '1px solid #555',
+                background: manualOn ? '#666' : '#444',
+                color: '#eee',
+                cursor: 'pointer',
+              }}
+            >
+              Manual
+            </button>
+          </div>
+        </div>
+        <div
+          style={{
+            background: 'rgba(0,0,0,0.6)',
+            border: '1px solid #555',
+            borderRadius: 6,
+            padding: 8,
+            boxSizing: 'border-box',
+          }}
+        >
+          <input
+            type="text"
+            value={commandInput}
+            onChange={(e) => setCommandInput(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleCommandSubmit()}
+            placeholder="Command (e.g. PF=on)"
+            style={{
+              width: '100%',
+              boxSizing: 'border-box',
+              padding: '6px 10px',
+              fontSize: 13,
+              background: '#222',
+              color: '#eee',
+              border: '1px solid #444',
+              borderRadius: 4,
+            }}
+          />
+        </div>
       </div>
       {placementFacilityOn && (
         <div
@@ -633,27 +894,12 @@ function App() {
             <span style={{ width: 88, flexShrink: 0 }}>Far</span>
             <input type="text" value={camFar} onChange={(e) => setCamFar(e.target.value)} onFocus={() => { cameraInputFocusedRef.current = true; }} onBlur={() => { cameraInputFocusedRef.current = false; handleCameraSubmit(); }} onKeyDown={(e) => e.key === 'Enter' && handleCameraSubmit()} style={inputStyle} />
           </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 88, flexShrink: 0 }}>Screen</span>
+            <span style={{ flex: 1 }}>{windowSize.width} × {windowSize.height}</span>
+          </div>
         </div>
       )}
-      <input
-        type="text"
-        value={commandInput}
-        onChange={(e) => setCommandInput(e.target.value)}
-        onKeyDown={(e) => e.key === 'Enter' && handleCommandSubmit()}
-        placeholder="Command (e.g. PF=on)"
-        style={{
-          position: 'absolute',
-          bottom: 16,
-          left: 16,
-          padding: '6px 10px',
-          fontSize: 13,
-          width: 200,
-          background: 'rgba(0,0,0,0.7)',
-          color: '#eee',
-          border: '1px solid #555',
-          borderRadius: 4,
-        }}
-      />
       {placementFacilityOn && (
         <div
           style={{
