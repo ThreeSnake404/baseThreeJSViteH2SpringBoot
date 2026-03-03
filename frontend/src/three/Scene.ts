@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { createRenderer } from './core/Renderer';
 import { setupResize } from './core/ResizeHandler';
-import { FACILITY_CENTERS } from '../padConfig';
+import { FACILITY_CENTERS, FACILITY_PADS, FAILURE_SPHERE_UNIFORM_RADIUS, PAD_CONFIG } from '../padConfig';
 
 /** Radians per second when steering left/right on the XZ plane. */
 const STEER_SPEED = 1.2;
@@ -33,6 +33,23 @@ const RACK_BATTERY_X_OFFSETS: [number, number, number, number] = [
   -RACK_PANEL_WIDTH / 2 + RACK_GAP + RACK_BATTERY_WIDTH / 2 + 2 * (RACK_BATTERY_WIDTH + RACK_GAP),
   -RACK_PANEL_WIDTH / 2 + RACK_GAP + RACK_BATTERY_WIDTH / 2 + 3 * (RACK_BATTERY_WIDTH + RACK_GAP),
 ];
+
+/** Bug waypoint: speed and arrival threshold. */
+const BUG_WAYPOINT_SPEED = 2;
+const BUG_WAYPOINT_ARRIVAL = 0.15;
+const GROUND_PLANE_Y = 0.1;
+/** Y-rotation offset so bug front (blue capsule) points toward waypoint; back (3x3 boxes) is opposite. */
+const BUG_FORWARD_Y_OFFSET = -Math.PI / 2;
+/** Charge value for empty slot (drawn black). */
+const BATTERY_EMPTY = -1;
+/** Seconds to fully charge a drained battery at a rack. */
+const BATTERY_CHARGE_TIME = 10;
+/** Max batteries a bug can carry. */
+const BUG_MAX_BATTERIES = 9;
+/** Distance from bug to pad center to trigger dock dialog. */
+const DOCK_THRESHOLD = 1.5;
+/** Duration in seconds for facility failure sphere expansion (red then dull gray). */
+const FAILURE_SPHERE_DURATION = 2;
 
 const CUBE_COLORS = [
   { name: 'red', hex: 0xff0000 },
@@ -89,6 +106,10 @@ export type BatteryApi = {
     parent?: THREE.Object3D
   ) => void;
   setBatteryCharge: (id: string, charge: number) => void;
+  /** Current charge (0–100) or negative for empty. Undefined if battery not found. */
+  getBatteryCharge: (id: string) => number | undefined;
+  /** True if this slot was filled with a full battery from the bug (simulation should not overwrite). */
+  isBatteryUserFilled: (id: string) => boolean;
   removeBattery: (id: string) => void;
   createBatteryRack: (
     rackId: string,
@@ -100,6 +121,31 @@ export type BatteryApi = {
   setFacilityFailed: (facilityId: string, failed: boolean) => void;
   /** Re-apply battery colors (fixes black draw after zoom/camera change). */
   refreshBatteryMaterials: () => void;
+  /** Get rack state for dock dialog. */
+  getRackState: (rackId: string) => { charged: number; drained: number; empty: number };
+  /** Get bug inventory (charged, drained; max 9 total). */
+  getBugInventory: (bugId: string) => { charged: number; drained: number };
+  /** Apply dock transfer after user answers dialog. */
+  dockAtPad: (
+    rackId: string,
+    bugId: string,
+    loadCharged: number,
+    acceptDrained: number,
+    loadYes: boolean,
+    acceptYes: boolean
+  ) => void;
+};
+
+export type DockAtPadParams = {
+  rackId: string;
+  bugId: string;
+  loadCharged: number;
+  acceptDrained: number;
+  /** First question (e.g. "Transfer n drained batteries from the rack to the bug?"). */
+  question1: string;
+  /** Second question (e.g. "Transfer m full batteries from the bug to the rack?"). */
+  question2: string;
+  reason?: string;
 };
 
 export type PlacementFacilityOptions = {
@@ -107,6 +153,7 @@ export type PlacementFacilityOptions = {
   onSelectionChange: (info: SelectedObjectInfo) => void;
   onCameraChange?: (info: CameraInfo) => void;
   onHoverInfoChange?: (info: HoverInfo) => void;
+  onDockAtPad?: (params: DockAtPadParams, onAnswer: (loadYes: boolean, acceptYes: boolean) => void) => void;
   setPositionRef?: { current: ((x: number, y: number, z: number) => void) | null };
   setRotationRef?: { current: ((rx: number, ry: number, rz: number) => void) | null };
   setScaleRef?: { current: ((sx: number, sy: number, sz: number) => void) | null };
@@ -135,6 +182,25 @@ export class Scene {
   private referenceVehicleGroup: THREE.Group | null = null;
   private shinyPathGroup: THREE.Group | null = null;
   private readonly buggies = new Map<string, THREE.Group>();
+  private selectedBugForWaypoints: string | null = null;
+  private waypoints: THREE.Vector3[] = [];
+  private waypointTerminalPlaced = false;
+  private waypointCurrentIndex = 0;
+  private readonly groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -GROUND_PLANE_Y);
+  private mousePosition3D: THREE.Vector3 | null = null;
+  private selectionCircle: THREE.Group | null = null;
+  private waypointMarkersGroup: THREE.Group | null = null;
+  private waypointMarkerObjects: THREE.Group[] = [];
+  private connectingLine: THREE.Line | null = null;
+  private readonly waypointLinePoints: THREE.Vector3[] = [];
+  private readonly tempVec3b = new THREE.Vector3();
+  private readonly bugInventory = new Map<string, { charged: number; drained: number }>();
+  private readonly batteriesAllowedToCharge = new Set<string>();
+  /** Battery IDs that are empty (transferred out). Never blink these; always draw black. */
+  private readonly emptyBatteryIds = new Set<string>();
+  /** Battery IDs filled with a full from the bug at a facility; simulation must not overwrite. */
+  private readonly userFilledBatteryIds = new Set<string>();
+  private lastFrameNearPads = new Set<string>();
   private colorIndex = 0;
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointer = new THREE.Vector2();
@@ -179,6 +245,7 @@ export class Scene {
   private boundOnKeyUp: (e: KeyboardEvent) => void;
   private boundOnPointerUp: (e: PointerEvent) => void;
   private boundOnOrbitChange: () => void;
+  private boundOnContextMenu: (e: MouseEvent) => void;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -236,6 +303,9 @@ export class Scene {
     this.boundOnPointerUp = this.onPointerUp.bind(this);
     this.boundOnOrbitChange = () => {
       if (this.pfOptions?.onCameraChange) this.pfOptions.onCameraChange(this.getCameraInfo());
+    };
+    this.boundOnContextMenu = (e: MouseEvent) => {
+      if (this.selectedBugForWaypoints) e.preventDefault();
     };
   }
 
@@ -404,26 +474,21 @@ export class Scene {
     }
     const group = new THREE.Group();
     group.position.set(center[0], center[1], center[2]);
-    const barLength = 2.5;
-    const barWidth = 0.2;
-    const barHeight = 0.08;
-    const mat = new THREE.MeshStandardMaterial({
-      color: 0x660000,
-      emissive: 0xff0000,
-      emissiveIntensity: 1,
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xcc0000,
+      transparent: true,
+      opacity: 0.8,
     });
-    const bar1 = new THREE.Mesh(
-      new THREE.BoxGeometry(barLength, barHeight, barWidth),
-      mat.clone()
-    );
-    const bar2 = new THREE.Mesh(
-      new THREE.BoxGeometry(barWidth, barHeight, barLength),
-      mat.clone()
-    );
-    group.add(bar1);
-    group.add(bar2);
-    group.rotation.y = Math.PI / 4;
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 24), mat);
+    group.add(mesh);
     group.userData.facilityId = facilityId;
+    group.userData.mesh = mesh;
+    group.userData.material = mat;
+    group.userData.startTime = null as number | null;
+    group.userData.done = false;
+    const R = FAILURE_SPHERE_UNIFORM_RADIUS;
+    group.scale.setScalar(R * 0.1);
+    group.visible = false;
     this.scene.add(group);
     return group;
   }
@@ -434,7 +499,41 @@ export class Scene {
       overlay = this.createFacilityFailureOverlay(facilityId);
       this.facilityFailureOverlays.set(facilityId, overlay);
     }
+    if (failed && overlay.userData.startTime == null) {
+      overlay.userData.startTime = this.clock.getElapsedTime();
+      overlay.userData.done = false;
+      const mat = overlay.userData.material as THREE.MeshBasicMaterial;
+      mat.color.setHex(0xcc0000);
+      mat.opacity = 0.8;
+    }
     overlay.visible = failed;
+  }
+
+  private updateFacilityFailureOverlays(): void {
+    const t = this.clock.getElapsedTime();
+    const R = FAILURE_SPHERE_UNIFORM_RADIUS;
+    this.facilityFailureOverlays.forEach((group) => {
+      if (!group.visible) return;
+      const mat = group.userData.material as THREE.MeshBasicMaterial;
+      const startTime = group.userData.startTime as number | null;
+      if (startTime == null) return;
+      const elapsed = t - startTime;
+      if (group.userData.done) {
+        group.scale.setScalar(R * 1.1);
+        return;
+      }
+      if (elapsed >= FAILURE_SPHERE_DURATION) {
+        group.scale.setScalar(R * 1.1);
+        mat.color.setHex(0x555555);
+        mat.transparent = false;
+        mat.opacity = 1;
+        group.userData.done = true;
+        return;
+      }
+      const u = elapsed / FAILURE_SPHERE_DURATION;
+      const scale = R * (0.1 + 1.0 * u);
+      group.scale.setScalar(scale);
+    });
   }
 
   private updateBatteryColors(id: string, charge: number): void {
@@ -442,6 +541,13 @@ export class Scene {
     if (!bat) return;
     const { planes } = bat;
     bat.charge = charge;
+    if (charge < 0) {
+      planes.forEach((mesh) => {
+        const mat = mesh.material as THREE.MeshBasicMaterial;
+        mat.color.setHex(0x000000);
+      });
+      return;
+    }
     for (let i = 0; i < planes.length; i++) {
       const mesh = planes[i];
       const mat = mesh.material as THREE.MeshBasicMaterial;
@@ -454,7 +560,13 @@ export class Scene {
   private setBatteryCharge(id: string, charge: number): void {
     const bat = this.batteries.get(id);
     if (!bat) return;
-    this.updateBatteryColors(id, Math.max(0, Math.min(100, charge)));
+    const c = charge < 0 ? BATTERY_EMPTY : Math.max(0, Math.min(100, charge));
+    this.updateBatteryColors(id, c);
+  }
+
+  private getBatteryCharge(id: string): number | undefined {
+    const bat = this.batteries.get(id);
+    return bat === undefined ? undefined : bat.charge;
   }
 
   private removeBattery(id: string): void {
@@ -473,6 +585,14 @@ export class Scene {
   private readonly blinkLerpColor = new THREE.Color();
 
   private updateBatteryBlink(elapsed: number): void {
+    this.emptyBatteryIds.forEach((id) => {
+      const bat = this.batteries.get(id);
+      if (!bat) return;
+      bat.planes.forEach((mesh) => {
+        const mat = mesh.material as THREE.MeshBasicMaterial;
+        mat.color.setHex(0x000000);
+      });
+    });
     const t = (elapsed % BATTERY_BLINK_CYCLE) / BATTERY_BLINK_CYCLE;
     const smooth = 0.5 - 0.5 * Math.cos(t * Math.PI * 2);
     this.blinkLerpColor.lerpColors(
@@ -481,8 +601,10 @@ export class Scene {
       smooth
     );
     const blinkHex = this.blinkLerpColor.getHex();
-    this.batteries.forEach((bat) => {
-      if (bat.charge > 0) return;
+    this.batteries.forEach((bat, id) => {
+      if (this.emptyBatteryIds.has(id)) return;
+      if (bat.charge < 0) return;
+      if (bat.charge !== 0) return;
       bat.planes.forEach((mesh) => {
         const mat = mesh.material as THREE.MeshBasicMaterial;
         mat.color.setHex(blinkHex);
@@ -498,6 +620,11 @@ export class Scene {
 
   private onKeyDown(event: KeyboardEvent): void {
     const key = event.key.toLowerCase();
+    if (key === 'escape' && this.selectedBugForWaypoints) {
+      this.clearWaypointState();
+      event.preventDefault();
+      return;
+    }
     const code = event.code;
     const pfOn = this.pfOptions?.getPFEnabled();
     if (pfOn) {
@@ -804,6 +931,9 @@ export class Scene {
   private onPointerMove(event: PointerEvent): void {
     if (this.disposed) return;
     this.updatePointerFromEvent(event);
+    if (this.selectedBugForWaypoints) {
+      this.mousePosition3D = this.getGroundIntersection();
+    }
     if (this.rotateMode && this.selectedObject) {
       if (this.lastPointerRotate === null) {
         this.lastPointerRotate = this.pointer.clone();
@@ -877,6 +1007,14 @@ export class Scene {
             for (const [id, group] of this.racks) {
               if (group === obj) {
                 label = id.startsWith('battery-rack-') ? id.slice('battery-rack-'.length) : id;
+                break;
+              }
+            }
+            if (label) break;
+            for (const [bugId, group] of this.buggies) {
+              if (group === obj) {
+                const inv = this.getBugInventory(bugId);
+                label = `${bugId}\n[${inv.drained}] drained batteries\n[${inv.charged}] full batteries`;
                 break;
               }
             }
@@ -1068,6 +1206,413 @@ export class Scene {
     );
   }
 
+  private getBugLength(bug: THREE.Group): number {
+    const box = new THREE.Box3().setFromObject(bug);
+    const size = box.getSize(this.tempVec3);
+    return Math.max(size.x, size.z);
+  }
+
+  private createSelectionCircle(radius: number): THREE.Group {
+    const group = new THREE.Group();
+    const ring = new THREE.RingGeometry(radius - 0.03, radius + 0.03, 32);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0x00ff00,
+      transparent: true,
+      opacity: 0.5,
+      side: THREE.DoubleSide,
+      depthTest: false,
+    });
+    const mesh = new THREE.Mesh(ring, mat);
+    mesh.rotation.x = -Math.PI / 2;
+    group.add(mesh);
+    return group;
+  }
+
+  private createWaypointMarker(): THREE.Group {
+    const group = new THREE.Group();
+    const radius = this.selectedBugForWaypoints
+      ? this.getBugLength(this.buggies.get(this.selectedBugForWaypoints)!)
+      : 1;
+    const ring = new THREE.RingGeometry(radius - 0.03, radius + 0.03, 32);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0x00ff00,
+      transparent: true,
+      opacity: 0.5,
+      side: THREE.DoubleSide,
+      depthTest: false,
+    });
+    const mesh = new THREE.Mesh(ring, mat);
+    mesh.rotation.x = -Math.PI / 2;
+    group.add(mesh);
+    const sphereGeom = new THREE.SphereGeometry(0.08, 16, 16);
+    const sphereMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+    const sphere = new THREE.Mesh(sphereGeom, sphereMat);
+    sphere.position.y = 0.01;
+    group.add(sphere);
+    return group;
+  }
+
+  private getGroundIntersection(): THREE.Vector3 | null {
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const ray = this.raycaster.ray;
+    const target = new THREE.Vector3();
+    if (ray.intersectPlane(this.groundPlane, target)) return target;
+    return null;
+  }
+
+  private addWaypoint(position: THREE.Vector3, terminal: boolean): void {
+    this.waypoints.push(position.clone());
+    if (terminal) this.waypointTerminalPlaced = true;
+    if (!this.waypointMarkersGroup) {
+      this.waypointMarkersGroup = new THREE.Group();
+      this.scene.add(this.waypointMarkersGroup);
+    }
+    const marker = this.createWaypointMarker();
+    marker.position.copy(position);
+    this.waypointMarkersGroup.add(marker);
+    this.waypointMarkerObjects.push(marker);
+  }
+
+  private updateConnectingLine(): void {
+    if (!this.connectingLine || !this.selectedBugForWaypoints) return;
+    const bug = this.buggies.get(this.selectedBugForWaypoints);
+    if (!bug) return;
+    this.waypointLinePoints.length = 0;
+    bug.getWorldPosition(this.tempVec3);
+    this.waypointLinePoints.push(this.tempVec3.clone());
+    for (let i = this.waypointCurrentIndex; i < this.waypoints.length; i++) {
+      this.waypointLinePoints.push(this.waypoints[i].clone());
+    }
+    if (!this.waypointTerminalPlaced && this.mousePosition3D) {
+      this.waypointLinePoints.push(this.mousePosition3D.clone());
+    }
+    if (this.waypointLinePoints.length < 2) {
+      this.connectingLine.visible = false;
+      return;
+    }
+    this.connectingLine.geometry.setFromPoints(this.waypointLinePoints);
+    this.connectingLine.visible = true;
+  }
+
+  private removeWaypointAndMarkerAtIndex(index: number): void {
+    if (index < 0 || index >= this.waypoints.length || index >= this.waypointMarkerObjects.length) return;
+    const marker = this.waypointMarkerObjects[index];
+    if (this.waypointMarkersGroup) this.waypointMarkersGroup.remove(marker);
+    marker.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.geometry?.dispose();
+        (obj.material as THREE.Material)?.dispose();
+      }
+    });
+    this.waypointMarkerObjects.splice(index, 1);
+    this.waypoints.splice(index, 1);
+  }
+
+  private updateBugAlongPath(dt: number): void {
+    if (!this.selectedBugForWaypoints || this.waypoints.length === 0) return;
+    const bug = this.buggies.get(this.selectedBugForWaypoints);
+    if (!bug) return;
+    if (this.waypointCurrentIndex >= this.waypoints.length) {
+      if (this.waypointTerminalPlaced) this.clearWaypointState();
+      return;
+    }
+    const target = this.waypoints[this.waypointCurrentIndex];
+    bug.getWorldPosition(this.tempVec3);
+    const dx = target.x - this.tempVec3.x;
+    const dz = target.z - this.tempVec3.z;
+    const dist = Math.sqrt(dx * dx + dz * dz) || 0.0001;
+    if (dist < BUG_WAYPOINT_ARRIVAL) {
+      this.removeWaypointAndMarkerAtIndex(this.waypointCurrentIndex);
+      return;
+    }
+    const move = Math.min(BUG_WAYPOINT_SPEED * dt, dist);
+    const t = move / dist;
+    bug.position.x += dx * t;
+    bug.position.z += dz * t;
+    const angle = Math.atan2(dx, dz) + BUG_FORWARD_Y_OFFSET;
+    bug.rotation.y = angle;
+  }
+
+  private clearWaypointState(): void {
+    this.selectedBugForWaypoints = null;
+    this.waypoints = [];
+    this.waypointMarkerObjects = [];
+    this.waypointTerminalPlaced = false;
+    this.waypointCurrentIndex = 0;
+    this.mousePosition3D = null;
+    if (this.selectionCircle?.parent) this.selectionCircle.parent.remove(this.selectionCircle);
+    this.selectionCircle = null;
+    if (this.waypointMarkersGroup) {
+      this.waypointMarkersGroup.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.geometry?.dispose();
+          (obj.material as THREE.Material)?.dispose();
+        }
+      });
+      this.scene.remove(this.waypointMarkersGroup);
+      this.waypointMarkersGroup = null;
+    }
+    if (this.connectingLine) {
+      this.scene.remove(this.connectingLine);
+      this.connectingLine.geometry.dispose();
+      (this.connectingLine.material as THREE.Material).dispose();
+      this.connectingLine = null;
+    }
+  }
+
+  private selectBugForWaypoints(bugId: string): void {
+    this.clearWaypointState();
+    this.selectedBugForWaypoints = bugId;
+    const bug = this.buggies.get(bugId);
+    if (!bug) return;
+    const radius = this.getBugLength(bug);
+    this.selectionCircle = this.createSelectionCircle(radius);
+    bug.getWorldPosition(this.tempVec3);
+    this.selectionCircle.position.set(this.tempVec3.x, GROUND_PLANE_Y, this.tempVec3.z);
+    this.scene.add(this.selectionCircle);
+    this.waypointMarkersGroup = new THREE.Group();
+    this.scene.add(this.waypointMarkersGroup);
+    const lineGeom = new THREE.BufferGeometry();
+    const lineMat = new THREE.LineBasicMaterial({
+      color: 0x00ff00,
+      transparent: true,
+      opacity: 0.6,
+      depthTest: false,
+    });
+    this.connectingLine = new THREE.Line(lineGeom, lineMat);
+    this.scene.add(this.connectingLine);
+  }
+
+  private getPadRoot(obj: THREE.Object3D): THREE.Object3D | null {
+    let current: THREE.Object3D | null = obj;
+    while (current) {
+      const name = (current as THREE.Object3D & { userData?: { displayName?: string } }).userData?.displayName ?? current.name ?? '';
+      if (typeof name === 'string' && name.includes('Pad')) return current;
+      current = current.parent;
+    }
+    return null;
+  }
+
+  private hitIsPad(obj: THREE.Object3D): boolean {
+    return this.getPadRoot(obj) !== null;
+  }
+
+  private getPadCenter(obj: THREE.Object3D): THREE.Vector3 {
+    const pad = this.getPadRoot(obj);
+    const root = pad ?? obj;
+    const box = new THREE.Box3().setFromObject(root);
+    return box.getCenter(new THREE.Vector3());
+  }
+
+  /** Treat as drained when charge is 0 or very low (simulation can leave fractional values). */
+  private static readonly DRAINED_THRESHOLD = 1;
+
+  private rackBatteryKey(rackId: string): string {
+    return rackId.startsWith('battery-rack-') ? rackId : `battery-rack-${rackId}`;
+  }
+
+  private getRackState(rackId: string): { charged: number; drained: number; empty: number } {
+    let charged = 0,
+      drained = 0,
+      empty = 0;
+    const key = this.rackBatteryKey(rackId);
+    for (let i = 1; i <= 4; i++) {
+      const bat = this.batteries.get(`${key}-battery-${i}`);
+      if (!bat) continue;
+      if (bat.charge < 0) empty++;
+      else if (bat.charge >= 100) charged++;
+      else if (bat.charge < Scene.DRAINED_THRESHOLD) drained++;
+    }
+    return { charged, drained, empty };
+  }
+
+  private getFacilityState(facilityId: string): { charged: number; drained: number; empty: number } {
+    let charged = 0,
+      drained = 0,
+      empty = 0;
+    const rackIds = FACILITY_PADS[facilityId];
+    if (!rackIds) return { charged, drained, empty };
+    for (const rId of rackIds) {
+      const s = this.getRackState(rId);
+      charged += s.charged;
+      drained += s.drained;
+      empty += s.empty;
+    }
+    return { charged, drained, empty };
+  }
+
+  private getBugInventory(bugId: string): { charged: number; drained: number } {
+    if (!this.bugInventory.has(bugId)) this.bugInventory.set(bugId, { charged: 0, drained: 0 });
+    return this.bugInventory.get(bugId)!;
+  }
+
+  private dockAtPad(
+    rackId: string,
+    bugId: string,
+    loadCharged: number,
+    acceptDrained: number,
+    loadYes: boolean,
+    acceptYes: boolean
+  ): void {
+    const inv = this.getBugInventory(bugId);
+    const isChargingStation = rackId.startsWith('ChargingStation');
+    const key = this.rackBatteryKey(rackId);
+    if (isChargingStation) {
+      // CS: question2 = "Transfer n full from station to bug?" (acceptYes). Do first to free slots.
+      if (acceptYes && loadCharged > 0) {
+        let taken = 0;
+        for (let i = 1; i <= 4 && taken < loadCharged; i++) {
+          const id = `${key}-battery-${i}`;
+          const bat = this.batteries.get(id);
+          if (bat && bat.charge >= 100) {
+            this.setBatteryCharge(id, BATTERY_EMPTY);
+            taken++;
+            inv.charged++;
+          }
+        }
+      }
+      // CS: question1 = "Transfer m drained from bug to station?" (loadYes). Into empty slots.
+      if (loadYes && acceptDrained > 0) {
+        let placed = 0;
+        for (let i = 1; i <= 4 && placed < acceptDrained; i++) {
+          const id = `${key}-battery-${i}`;
+          const bat = this.batteries.get(id);
+          if (bat && bat.charge < 0) {
+            this.setBatteryCharge(id, 0);
+            this.batteriesAllowedToCharge.add(id);
+            placed++;
+            inv.drained--;
+          }
+        }
+      }
+    } else {
+      // Facility: question1 = "Transfer n drained from rack to bug?" (loadYes). Take from all racks in this facility.
+      if (loadYes && acceptDrained > 0) {
+        const facilityId = this.getFacilityForRack(rackId);
+        const rackIds = facilityId ? (FACILITY_PADS[facilityId] ?? [rackId]) : [rackId];
+        let taken = 0;
+        for (const rId of rackIds) {
+          if (taken >= acceptDrained) break;
+          const rKey = this.rackBatteryKey(rId);
+          for (let i = 1; i <= 4 && taken < acceptDrained; i++) {
+            const id = `${rKey}-battery-${i}`;
+            const bat = this.batteries.get(id);
+            if (bat && bat.charge >= 0 && bat.charge < Scene.DRAINED_THRESHOLD) {
+              bat.charge = BATTERY_EMPTY;
+              this.emptyBatteryIds.add(id);
+              this.updateBatteryColors(id, BATTERY_EMPTY);
+              taken++;
+              inv.drained++;
+            }
+          }
+        }
+      }
+      // Facility: question2 = "Transfer m full from bug to rack?" (acceptYes). Into empty slots.
+      if (acceptYes && loadCharged > 0) {
+        let placed = 0;
+        for (let i = 1; i <= 4 && placed < loadCharged; i++) {
+          const id = `${key}-battery-${i}`;
+          const bat = this.batteries.get(id);
+          if (bat && bat.charge < 0) {
+            this.emptyBatteryIds.delete(id);
+            this.userFilledBatteryIds.add(id);
+            this.setBatteryCharge(id, 100);
+            placed++;
+            inv.charged--;
+          }
+        }
+      }
+    }
+  }
+
+  private isBatteryUserFilled(id: string): boolean {
+    return this.userFilledBatteryIds.has(id);
+  }
+
+  private getFacilityForRack(rackId: string): string | undefined {
+    const base = rackId.startsWith('battery-rack-') ? rackId.slice('battery-rack-'.length) : rackId;
+    for (const [facilityId, rackIds] of Object.entries(FACILITY_PADS)) {
+      if (rackIds.includes(base) || rackIds.includes(rackId)) return facilityId;
+    }
+    return undefined;
+  }
+
+  private checkDockAtPad(): void {
+    if (!this.selectedBugForWaypoints) return;
+    const bug = this.buggies.get(this.selectedBugForWaypoints);
+    if (!bug || !this.pfOptions?.onDockAtPad) return;
+    bug.getWorldPosition(this.tempVec3);
+    const bx = this.tempVec3.x;
+    const bz = this.tempVec3.z;
+    const currentNear = new Set<string>();
+    for (const pad of PAD_CONFIG) {
+      const [px, , pz] = pad.position;
+      const dist = Math.sqrt((bx - px) ** 2 + (bz - pz) ** 2);
+      if (dist <= DOCK_THRESHOLD) currentNear.add(pad.id);
+    }
+    for (const rackId of currentNear) {
+      if (this.lastFrameNearPads.has(rackId)) continue;
+      const inv = this.getBugInventory(this.selectedBugForWaypoints);
+      const total = inv.charged + inv.drained;
+      const isCS = rackId.startsWith('ChargingStation');
+      const room = BUG_MAX_BATTERIES - total;
+      const facilityId = this.getFacilityForRack(rackId);
+      const state = isCS ? this.getRackState(rackId) : (facilityId ? this.getFacilityState(facilityId) : this.getRackState(rackId));
+      let loadCharged: number;
+      let acceptDrained: number;
+      let question1: string;
+      let question2: string;
+      if (isCS) {
+        const nFullToBug = Math.min(state.charged, room);
+        const mDrainedToStation = Math.min(inv.drained, state.empty + nFullToBug);
+        loadCharged = nFullToBug;
+        acceptDrained = mDrainedToStation;
+        question1 = `Transfer ${mDrainedToStation} drained batteries from the bug to the charging station?`;
+        question2 = `Transfer ${nFullToBug} full batteries from the charging station to the bug?`;
+      } else {
+        const nDrainedToBug = Math.min(state.drained, room);
+        const mFullToRack = Math.min(inv.charged, state.empty + nDrainedToBug);
+        loadCharged = mFullToRack;
+        acceptDrained = nDrainedToBug;
+        question1 = `Transfer ${nDrainedToBug} drained batteries from the rack to the bug?`;
+        question2 = `Transfer ${mFullToRack} full batteries from the bug to the rack?`;
+      }
+      let reason: string | undefined;
+      if (loadCharged === 0 && acceptDrained === 0) {
+        if (isCS) {
+          if (total >= BUG_MAX_BATTERIES && inv.drained === 0) reason = 'Bug cannot carry more; bug has no drained to transfer.';
+          else if (total >= BUG_MAX_BATTERIES) reason = 'Bug cannot carry more batteries.';
+          else if (state.charged === 0 && state.empty === 0) reason = 'Charging station has no full batteries and no empty slots.';
+          else if (state.charged === 0) reason = 'Charging station has no full batteries.';
+          else if (inv.drained === 0) reason = 'Bug has no drained batteries to transfer.';
+          else reason = 'Charging station has no empty slots.';
+        } else {
+          if (state.drained === 0) reason = 'This location has no drained batteries.';
+          else if (total >= BUG_MAX_BATTERIES) reason = 'Bug cannot carry more batteries.';
+          else reason = 'Nothing to transfer at this location.';
+        }
+      }
+      this.pfOptions.onDockAtPad(
+        { rackId, bugId: this.selectedBugForWaypoints, loadCharged, acceptDrained, question1, question2, reason },
+        (loadYes, acceptYes) => {
+          this.dockAtPad(rackId, this.selectedBugForWaypoints!, loadCharged, acceptDrained, loadYes, acceptYes);
+        }
+      );
+      break;
+    }
+    this.lastFrameNearPads = currentNear;
+  }
+
+  private updateBatteryCharging(dt: number): void {
+    const rate = (100 / BATTERY_CHARGE_TIME) * dt;
+    this.batteries.forEach((bat, id) => {
+      if (bat.charge < 0 || bat.charge >= 100) return;
+      if (!this.batteriesAllowedToCharge.has(id)) return;
+      bat.charge = Math.min(100, bat.charge + rate);
+      this.updateBatteryColors(id, bat.charge);
+    });
+  }
+
   /** Find pad by name or displayName in ShinyPath and set buggy position to its world position (y + 0.1). */
   private positionBuggyOnPad(padName: string, buggy: THREE.Group): void {
     if (!this.shinyPathGroup) return;
@@ -1131,28 +1676,75 @@ export class Scene {
   }
 
   private onPointerDown(event: PointerEvent): void {
-    if (this.disposed || event.button !== 0) return;
-    const rect = this.canvas.getBoundingClientRect();
-    this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    this.updatePointerFromEvent(event);
     this.raycaster.setFromCamera(this.pointer, this.camera);
+    if (this.disposed) return;
+
+    const buggyRoots = Array.from(this.buggies.values());
+    const bugHits = buggyRoots.length > 0 ? this.raycaster.intersectObjects(buggyRoots, true) : [];
+    const bugHit = bugHits.length > 0 ? bugHits[0] : null;
+    const bugRoot = bugHit ? this.findRootForObject(bugHit.object) : null;
+    let bugIdFromRoot: string | null = null;
+    if (bugRoot) {
+      for (const [id, group] of this.buggies) {
+        if (group === bugRoot) {
+          bugIdFromRoot = id;
+          break;
+        }
+      }
+    }
+
+    if (event.button === 2) {
+      if (this.selectedBugForWaypoints) {
+        const pos = this.getGroundIntersection();
+        if (pos) this.addWaypoint(pos, true);
+        event.preventDefault();
+      } else if (bugIdFromRoot) {
+        this.selectBugForWaypoints(bugIdFromRoot);
+        event.preventDefault();
+      }
+      return;
+    }
+
+    if (event.button === 0) {
+      if (bugIdFromRoot) {
+        this.selectBugForWaypoints(bugIdFromRoot);
+        return;
+      }
+      if (this.selectedBugForWaypoints) {
+        let padHit: THREE.Intersection | null = null;
+        if (this.shinyPathGroup) {
+          const mapHits = this.raycaster.intersectObject(this.shinyPathGroup, true);
+          if (mapHits.length > 0 && this.hitIsPad(mapHits[0].object)) padHit = mapHits[0];
+        }
+        if (padHit) {
+          const center = this.getPadCenter(padHit.object);
+          center.y = GROUND_PLANE_Y;
+          this.addWaypoint(center, true);
+        } else {
+          const pos = this.getGroundIntersection();
+          if (pos) this.addWaypoint(pos, false);
+        }
+        return;
+      }
+    }
+
     if (this.pfOptions?.getPFEnabled()) {
       const roots = this.getSelectableRoots();
       const hits = this.raycaster.intersectObjects(roots, true);
-      if (hits.length > 0) {
-        const root = this.findRootForObject(hits[0].object);
-        if (root) {
-          if (root === this.selectedObject) {
-            this.pointerDownOnSelected = true;
-            this.canvas.setPointerCapture?.(event.pointerId);
-          } else if (this.selectedObject !== null) {
-            this.setSelection(null);
-            this.pointerDownOnSelected = false;
-          } else {
-            this.setSelection(root);
-            this.pointerDownOnSelected = true;
-            this.canvas.setPointerCapture?.(event.pointerId);
-          }
+      const hit = hits.length > 0 ? hits[0] : null;
+      const root = hit ? this.findRootForObject(hit.object) : null;
+      if (hits.length > 0 && root) {
+        if (root === this.selectedObject) {
+          this.pointerDownOnSelected = true;
+          this.canvas.setPointerCapture?.(event.pointerId);
+        } else if (this.selectedObject !== null) {
+          this.setSelection(null);
+          this.pointerDownOnSelected = false;
+        } else {
+          this.setSelection(root);
+          this.pointerDownOnSelected = true;
+          this.canvas.setPointerCapture?.(event.pointerId);
         }
       } else {
         this.setSelection(null);
@@ -1160,6 +1752,7 @@ export class Scene {
       }
       return;
     }
+    if (event.button !== 0) return;
     const hits = this.raycaster.intersectObject(this.cubeMesh, false);
     if (hits.length === 0) return;
     const currentName = CUBE_COLORS[this.colorIndex].name;
@@ -1313,6 +1906,7 @@ export class Scene {
     this.canvas.addEventListener('pointermove', this.boundOnPointerMove);
     this.canvas.addEventListener('pointerup', this.boundOnPointerUp);
     this.canvas.addEventListener('pointercancel', this.boundOnPointerUp);
+    this.canvas.addEventListener('contextmenu', this.boundOnContextMenu);
     window.addEventListener('keydown', this.boundOnKeyDown);
     window.addEventListener('keyup', this.boundOnKeyUp);
     if (this.pfOptions?.setPositionRef) {
@@ -1335,11 +1929,16 @@ export class Scene {
       this.pfOptions.batteryApiRef.current = {
         createBattery: this.createBattery.bind(this),
         setBatteryCharge: this.setBatteryCharge.bind(this),
+        getBatteryCharge: this.getBatteryCharge.bind(this),
+        isBatteryUserFilled: this.isBatteryUserFilled.bind(this),
         removeBattery: this.removeBattery.bind(this),
         createBatteryRack: this.createBatteryRack.bind(this),
         removeBatteryRack: this.removeBatteryRack.bind(this),
         setFacilityFailed: this.setFacilityFailed.bind(this),
         refreshBatteryMaterials: this.refreshBatteryMaterials.bind(this),
+        getRackState: this.getRackState.bind(this),
+        getBugInventory: this.getBugInventory.bind(this),
+        dockAtPad: this.dockAtPad.bind(this),
       };
     }
     this.loadAxisHelper();
@@ -1412,10 +2011,22 @@ export class Scene {
           this.referenceVehicleGroup.position.addScaledVector(this.moveDirection, sign * MOVE_SPEED * dt);
         }
       }
+      if (this.selectedBugForWaypoints) {
+        const bug = this.buggies.get(this.selectedBugForWaypoints);
+        if (bug && this.selectionCircle) {
+          bug.getWorldPosition(this.tempVec3);
+          this.selectionCircle.position.set(this.tempVec3.x, GROUND_PLANE_Y, this.tempVec3.z);
+        }
+        this.updateConnectingLine();
+        this.updateBugAlongPath(dt);
+        this.checkDockAtPad();
+      }
+      this.updateBatteryCharging(dt);
       const t = this.clock.getElapsedTime();
       this.cubeMesh.rotation.x = t * 0.2;
       this.cubeMesh.rotation.y = t * 0.3;
       this.updateBatteryBlink(t);
+      this.updateFacilityFailureOverlays();
       this.renderer.render(this.scene, this.camera);
     };
     loop();
@@ -1423,6 +2034,7 @@ export class Scene {
 
   dispose(): void {
     this.disposed = true;
+    this.clearWaypointState();
     this.removeDragAxisLine();
     this.attachRotationHelper(null);
     if (this.rotationHelperGroup) {
@@ -1458,6 +2070,7 @@ export class Scene {
     this.canvas.removeEventListener('pointermove', this.boundOnPointerMove);
     this.canvas.removeEventListener('pointerup', this.boundOnPointerUp);
     this.canvas.removeEventListener('pointercancel', this.boundOnPointerUp);
+    this.canvas.removeEventListener('contextmenu', this.boundOnContextMenu);
     window.removeEventListener('keydown', this.boundOnKeyDown);
     window.removeEventListener('keyup', this.boundOnKeyUp);
     if (this.tooltipEl?.parentNode) this.tooltipEl.parentNode.removeChild(this.tooltipEl);

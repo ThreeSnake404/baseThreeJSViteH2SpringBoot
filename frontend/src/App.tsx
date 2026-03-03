@@ -5,11 +5,12 @@ import {
   type CameraInfo,
   type CameraParams,
   type HoverInfo,
+  type DockAtPadParams,
 } from './three/Scene';
 import { BatteryRack } from './BatteryRack';
 import {
   PAD_CONFIG,
-  getAllBatteriesInOrder,
+  getDrainableFacilityBatteries,
 } from './padConfig';
 
 const API_BASE = '';
@@ -64,8 +65,11 @@ function App() {
   const setCameraRef = useRef<((params: CameraParams) => void) | null>(null);
   const batteryApiRef = useRef<import('./three/Scene').BatteryApi | null>(null);
   const [hoverInfo, setHoverInfo] = useState<HoverInfo>(null);
-  const [simulationRunning, setSimulationRunning] = useState(false);
+  const [simulationRunning, setSimulationRunning] = useState(true);
   const simulationStartTimeRef = useRef<number>(0);
+  const [dockParams, setDockParams] = useState<DockAtPadParams | null>(null);
+  const [dockLoadYes, setDockLoadYes] = useState<boolean | null>(null);
+  const dockOnAnswerRef = useRef<((loadYes: boolean, acceptYes: boolean) => void) | null>(null);
   pfEnabledRef.current = placementFacilityOn;
 
   const onColorChange = useCallback((currentColor: string, nextColor: string) => {
@@ -186,6 +190,11 @@ function App() {
         setScaleRef,
         setCameraRef,
         batteryApiRef,
+        onDockAtPad: (params, onAnswer) => {
+          dockOnAnswerRef.current = onAnswer;
+          setDockParams(params);
+          setDockLoadYes(null);
+        },
       }
     );
     scene.start();
@@ -289,61 +298,40 @@ function App() {
     setCameraRef.current?.(params);
   };
 
-  const allBatteriesInOrder = useMemo(() => getAllBatteriesInOrder(), []);
+  const drainableFacilities = useMemo(() => getDrainableFacilityBatteries(), []);
   const BATTERY_DRAIN_SEC = 30;
-
-  // On load: fully charge all batteries, then fully drain GreenHouse2Hrack. Re-run for a few seconds so we catch racks created asynchronously (so 0% and blink apply).
-  useEffect(() => {
-    const apply = () => {
-      const api = batteryApiRef.current;
-      if (!api) return;
-      for (const pad of PAD_CONFIG) {
-        const rackId = `battery-rack-${pad.id}`;
-        for (let i = 1; i <= 4; i++) api.setBatteryCharge(`${rackId}-battery-${i}`, 100);
-      }
-      for (let i = 1; i <= 4; i++) api.setBatteryCharge(`battery-rack-GreenHouse2Hrack-battery-${i}`, 0);
-    };
-    apply();
-    const t = setInterval(apply, 200);
-    const stop = setTimeout(() => clearInterval(t), 3000);
-    return () => { clearInterval(t); clearTimeout(stop); };
-  }, []);
 
   const simulationRafRef = useRef<number>(0);
   useEffect(() => {
     if (!simulationRunning || !batteryApiRef.current) return;
     simulationStartTimeRef.current = Date.now();
-    let lastIndex = -1;
     const tick = () => {
       if (!batteryApiRef.current) return;
       const elapsed = (Date.now() - simulationStartTimeRef.current) / 1000;
-      const currentIndex = Math.floor(elapsed / BATTERY_DRAIN_SEC);
-      const chargeCurrent =
-        currentIndex < allBatteriesInOrder.length
-          ? Math.max(0, 100 * (1 - (elapsed % BATTERY_DRAIN_SEC) / BATTERY_DRAIN_SEC))
-          : 0;
-      for (let i = 0; i < allBatteriesInOrder.length; i++) {
-        const c = i < currentIndex ? 0 : i === currentIndex ? chargeCurrent : 100;
-        batteryApiRef.current.setBatteryCharge(allBatteriesInOrder[i].batteryId, c);
-      }
-      if (currentIndex > lastIndex && lastIndex >= 0 && lastIndex < allBatteriesInOrder.length) {
-        const { facilityId } = allBatteriesInOrder[lastIndex];
-        const nextFacility =
-          currentIndex < allBatteriesInOrder.length
-            ? allBatteriesInOrder[currentIndex].facilityId
-            : null;
-        if (nextFacility !== facilityId) {
+      for (const { facilityId, batteryIds } of drainableFacilities) {
+        const currentIndex = Math.floor(elapsed / BATTERY_DRAIN_SEC);
+        const chargeCurrent =
+          currentIndex < batteryIds.length
+            ? Math.max(0, 100 * (1 - (elapsed % BATTERY_DRAIN_SEC) / BATTERY_DRAIN_SEC))
+            : 0;
+        const api = batteryApiRef.current;
+        for (let i = 0; i < batteryIds.length; i++) {
+          const id = batteryIds[i];
+          const current = api.getBatteryCharge(id);
+          if (current !== undefined && current < 0) continue;
+          if (api.isBatteryUserFilled(id)) continue;
+          const c = i < currentIndex ? 0 : i === currentIndex ? chargeCurrent : 100;
+          api.setBatteryCharge(id, c);
+        }
+        if (currentIndex >= batteryIds.length) {
           batteryApiRef.current.setFacilityFailed(facilityId, true);
         }
       }
-      lastIndex = currentIndex;
-      if (currentIndex < allBatteriesInOrder.length) {
-        simulationRafRef.current = requestAnimationFrame(tick);
-      }
+      simulationRafRef.current = requestAnimationFrame(tick);
     };
     simulationRafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(simulationRafRef.current);
-  }, [simulationRunning, allBatteriesInOrder]);
+  }, [simulationRunning, drainableFacilities]);
 
   const inputStyle: React.CSSProperties = {
     width: 56,
@@ -384,9 +372,101 @@ function App() {
             fontFamily: 'monospace',
             pointerEvents: 'none',
             zIndex: 2000,
+            whiteSpace: 'pre-line',
           }}
         >
           {hoverInfo.label}
+        </div>
+      )}
+      {dockParams && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.6)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 3000,
+          }}
+        >
+          <div
+            style={{
+              background: '#2a2a2a',
+              padding: 20,
+              borderRadius: 8,
+              border: '1px solid #555',
+              minWidth: 280,
+            }}
+          >
+            <p style={{ margin: '0 0 8px', color: '#eee', fontSize: 14 }}>
+              {dockParams.question1}
+            </p>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+              <button type="button" onClick={() => setDockLoadYes(true)} style={{ padding: '6px 14px', cursor: 'pointer' }}>
+                Yes
+              </button>
+              <button type="button" onClick={() => setDockLoadYes(false)} style={{ padding: '6px 14px', cursor: 'pointer' }}>
+                No
+              </button>
+            </div>
+            <p style={{ margin: '0 0 8px', color: '#eee', fontSize: 14 }}>
+              {dockParams.question2}
+            </p>
+            <div style={{ display: 'flex', gap: 8, marginBottom: dockParams.reason ? 12 : 0 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  dockOnAnswerRef.current?.(dockLoadYes ?? false, true);
+                  setDockParams(null);
+                  dockOnAnswerRef.current = null;
+                }}
+                style={{ padding: '6px 14px', cursor: 'pointer' }}
+              >
+                Yes
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  dockOnAnswerRef.current?.(dockLoadYes ?? false, false);
+                  setDockParams(null);
+                  dockOnAnswerRef.current = null;
+                }}
+                style={{ padding: '6px 14px', cursor: 'pointer' }}
+              >
+                No
+              </button>
+            </div>
+            {dockParams.reason && (
+              <p style={{ margin: '0 0 12px', color: '#aaa', fontSize: 12 }}>
+                {dockParams.reason}
+              </p>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  dockOnAnswerRef.current?.(dockLoadYes ?? false, false);
+                  setDockParams(null);
+                  dockOnAnswerRef.current = null;
+                }}
+                style={{ padding: '6px 14px', cursor: 'pointer' }}
+              >
+                Done
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  dockOnAnswerRef.current?.(false, false);
+                  setDockParams(null);
+                  dockOnAnswerRef.current = null;
+                }}
+                style={{ padding: '6px 14px', cursor: 'pointer' }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
         </div>
       )}
       <div

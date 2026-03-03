@@ -24,7 +24,7 @@ export const PAD_CONFIG: PadConfig[] = [
   { id: 'ChargingStationHrack2', position: [9.056, 0.2, -3.745], orientation: 'hrack' },
   { id: 'GreenHouse1Hrack', position: [8.955, 0.2, 7.272], orientation: 'hrack' },
   { id: 'GreenHouse1Vrack', position: [7.295, 0.2, 8.932], orientation: 'vrack' },
-  { id: 'GreenHouse2Hrack', position: [-8.073, 0.2, -6.436], orientation: 'hrack', initialCharges: [0, 0, 0, 0] },
+  { id: 'GreenHouse2Hrack', position: [-8.073, 0.2, -6.436], orientation: 'hrack' },
   { id: 'GreenHouse2Vrack', position: [-6.413, 0.2, -8.096], orientation: 'vrack' },
   { id: 'IceMine1Hrack', position: [1.892, 0.2, -3.338], orientation: 'vrack' },
   { id: 'IceMine1Vrack', position: [4.231, 0.2, -0.96], orientation: 'hrack' },
@@ -41,7 +41,7 @@ export const FACILITY_PADS: Record<string, string[]> = {
   IceMine2: ['IceMine2Hrack', 'IceMine2Vrack'],
 };
 
-/** Facility id -> [x, y, z] for drawing failure red X (center of racks, y raised). */
+/** Facility id -> [x, y, z] for failure overlay (center of racks, y raised). */
 export const FACILITY_CENTERS: Record<string, [number, number, number]> = (() => {
   const out: Record<string, [number, number, number]> = {};
   for (const [facilityId, rackIds] of Object.entries(FACILITY_PADS)) {
@@ -53,6 +53,37 @@ export const FACILITY_CENTERS: Record<string, [number, number, number]> = (() =>
     out[facilityId] = [x, y, z];
   }
   return out;
+})();
+
+/** Facility id -> radius (max distance from center to any rack). Used for failure sphere size. */
+export const FACILITY_RADIUS: Record<string, number> = (() => {
+  const out: Record<string, number> = {};
+  for (const [facilityId, rackIds] of Object.entries(FACILITY_PADS)) {
+    const center = FACILITY_CENTERS[facilityId];
+    if (!center) continue;
+    let maxDist = 0;
+    for (const rid of rackIds) {
+      const pad = PAD_CONFIG.find((p) => p.id === rid);
+      if (!pad) continue;
+      const dx = pad.position[0] - center[0];
+      const dz = pad.position[2] - center[2];
+      const d = Math.sqrt(dx * dx + dz * dz);
+      if (d > maxDist) maxDist = d;
+    }
+    out[facilityId] = Math.max(maxDist, 0.5);
+  }
+  return out;
+})();
+
+/** Uniform radius for all failure spheres (GreenHouse/IceMine) so they appear same size, centered over dome. */
+export const FAILURE_SPHERE_UNIFORM_RADIUS = (() => {
+  const drainable = ['GreenHouse1', 'GreenHouse2', 'IceMine1', 'IceMine2'];
+  let maxR = 1;
+  for (const fid of drainable) {
+    const r = FACILITY_RADIUS[fid];
+    if (r != null && r > maxR) maxR = r;
+  }
+  return maxR;
 })();
 
 /** All batteries in drain order: [facilityId, batteryId][]. Used for simulation. */
@@ -71,4 +102,20 @@ export function getAllBatteriesInOrder(): { facilityId: string; batteryId: strin
     }
   }
   return order;
+}
+
+/** Facilities that drain (excludes ChargingStation). Each facility has batteries in drain order. */
+export function getDrainableFacilityBatteries(): { facilityId: string; batteryIds: string[] }[] {
+  const out: { facilityId: string; batteryIds: string[] }[] = [];
+  for (const [facilityId, rackIds] of Object.entries(FACILITY_PADS)) {
+    if (facilityId === 'ChargingStation') continue;
+    const batteryIds: string[] = [];
+    for (const rackId of rackIds) {
+      for (let i = 1; i <= 4; i++) {
+        batteryIds.push(`battery-rack-${rackId}-battery-${i}`);
+      }
+    }
+    out.push({ facilityId, batteryIds });
+  }
+  return out;
 }
