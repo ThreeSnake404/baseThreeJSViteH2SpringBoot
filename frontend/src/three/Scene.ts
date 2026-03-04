@@ -119,6 +119,8 @@ export type BatteryApi = {
   ) => void;
   removeBatteryRack: (rackId: string) => void;
   setFacilityFailed: (facilityId: string, failed: boolean) => void;
+  /** Reset simulation: refill all batteries, clear overlays, return bugs to start. */
+  resetSimulation: () => void;
   /** Re-apply battery colors (fixes black draw after zoom/camera change). */
   refreshBatteryMaterials: () => void;
   /** Get rack state for dock dialog. */
@@ -153,7 +155,9 @@ export type PlacementFacilityOptions = {
   onSelectionChange: (info: SelectedObjectInfo) => void;
   onCameraChange?: (info: CameraInfo) => void;
   onHoverInfoChange?: (info: HoverInfo) => void;
+  onRoutingChange?: (isRouting: boolean) => void;
   onDockAtPad?: (params: DockAtPadParams, onAnswer: (loadYes: boolean, acceptYes: boolean) => void) => void;
+  onRimWallBlock?: () => void;
   setPositionRef?: { current: ((x: number, y: number, z: number) => void) | null };
   setRotationRef?: { current: ((rx: number, ry: number, rz: number) => void) | null };
   setScaleRef?: { current: ((sx: number, sy: number, sz: number) => void) | null };
@@ -184,6 +188,15 @@ export class Scene {
   private readonly buggies = new Map<string, THREE.Group>();
   /** Bug currently being given waypoints (has selection circle + connecting line). */
   private activeRoutingBugId: string | null = null;
+
+  private setActiveRoutingBugId(id: string | null): void {
+    const wasRouting = this.activeRoutingBugId !== null;
+    this.activeRoutingBugId = id;
+    const isRouting = id !== null;
+    if (wasRouting !== isRouting) {
+      this.pfOptions?.onRoutingChange?.(isRouting);
+    }
+  }
   /** Per-bug route state so multiple bugs can have active routes. */
   private readonly bugRouteStates = new Map<
     string,
@@ -203,6 +216,7 @@ export class Scene {
   private lastFrameNearPadsByBug = new Map<string, Set<string>>();
   private readonly tempVec3b = new THREE.Vector3();
   private readonly bugInventory = new Map<string, { charged: number; drained: number }>();
+  private readonly bugStartPads = new Map<string, { padName: string; rotation: number }>();
   private readonly batteriesAllowedToCharge = new Set<string>();
   /** Battery IDs that are empty (transferred out). Never blink these; always draw black. */
   private readonly emptyBatteryIds = new Set<string>();
@@ -210,6 +224,8 @@ export class Scene {
   private readonly userFilledBatteryIds = new Set<string>();
   private colorIndex = 0;
   private readonly raycaster = new THREE.Raycaster();
+  private readonly segRaycaster = new THREE.Raycaster();
+  private rimWallMesh: THREE.Object3D | null = null;
   private readonly pointer = new THREE.Vector2();
   private tooltipEl: HTMLDivElement | null = null;
   private readonly keysPressed = new Set<string>();
@@ -619,6 +635,37 @@ export class Scene {
     });
   }
 
+  private resetSimulation(): void {
+    // Clear all route/waypoint state
+    this.clearWaypointState();
+
+    // Clear battery transfer sets
+    this.emptyBatteryIds.clear();
+    this.userFilledBatteryIds.clear();
+    this.batteriesAllowedToCharge.clear();
+
+    // Refill all batteries to 100
+    for (const [id] of this.batteries) {
+      this.updateBatteryColors(id, 100);
+    }
+
+    // Clear bug inventories
+    this.bugInventory.clear();
+
+    // Clear all facility failure overlays
+    for (const [facilityId] of this.facilityFailureOverlays) {
+      this.setFacilityFailed(facilityId, false);
+    }
+
+    // Return bugs to starting positions and rotations
+    for (const [bugId, { padName, rotation }] of this.bugStartPads) {
+      const bug = this.buggies.get(bugId);
+      if (!bug) continue;
+      bug.rotation.y = rotation;
+      this.positionBuggyOnPad(padName, bug);
+    }
+  }
+
   private refreshBatteryMaterials(): void {
     this.batteries.forEach((bat, id) => {
       this.updateBatteryColors(id, bat.charge);
@@ -629,7 +676,7 @@ export class Scene {
     const key = event.key.toLowerCase();
     if (key === 'escape' && this.activeRoutingBugId) {
       this.clearBugWaypointState(this.activeRoutingBugId);
-      this.activeRoutingBugId = null;
+      this.setActiveRoutingBugId(null);
       event.preventDefault();
       return;
     }
@@ -1179,6 +1226,13 @@ export class Scene {
         this.shinyPathGroup = gltf.scene;
         this.shinyPathGroup.position.set(0, 0, 0);
         this.scene.add(this.shinyPathGroup);
+        // Cache the RimWall object for route segment collision detection.
+        // Tunnels are holes (absent geometry) so segments through them never hit.
+        this.shinyPathGroup.traverse((obj) => {
+          if (obj.userData.displayName === 'RimWall' || obj.name === 'RingWall') {
+            this.rimWallMesh = obj;
+          }
+        });
         this.buggies.forEach((buggy, id) => {
           const padName = (id === 'bug1' ? 'VehicleBayPad1' : id === 'bug2' ? 'VehicleBayPad2' : id === 'bug3' ? 'VehicleBayPad3' : 'VehicleBayPad4');
           this.positionBuggyOnPad(padName, buggy);
@@ -1267,17 +1321,53 @@ export class Scene {
     return null;
   }
 
+  /**
+   * Returns true if the line segment from `from` to `to` intersects any solid
+   * part of the RimWall mesh. Tunnel openings are absent geometry, so segments
+   * passing through tunnels return false (no hit).
+   */
+  private segmentCrossesRimWall(from: THREE.Vector3, to: THREE.Vector3): boolean {
+    if (!this.rimWallMesh) return false;
+    const dir = new THREE.Vector3().subVectors(to, from);
+    const length = dir.length();
+    if (length < 0.001) return false;
+    dir.normalize();
+    this.segRaycaster.set(from, dir);
+    this.segRaycaster.near = 0;
+    this.segRaycaster.far = length;
+    return this.segRaycaster.intersectObject(this.rimWallMesh, true).length > 0;
+  }
+
   private addWaypoint(position: THREE.Vector3, terminal: boolean): void {
     const bugId = this.activeRoutingBugId;
     if (!bugId) return;
-    let state = this.bugRouteStates.get(bugId);
+    const state = this.bugRouteStates.get(bugId);
     if (!state) return;
+
+    // Determine the start of this new segment (bug position if first waypoint, else last waypoint).
+    let segFrom: THREE.Vector3;
+    if (state.waypoints.length > 0) {
+      segFrom = state.waypoints[state.waypoints.length - 1];
+    } else {
+      const bug = this.buggies.get(bugId);
+      if (!bug) return;
+      segFrom = new THREE.Vector3();
+      bug.getWorldPosition(segFrom);
+    }
+
+    // Reject the segment if it passes through solid RimWall (tunnels are gaps — no geometry hit).
+    if (this.segmentCrossesRimWall(segFrom, position)) {
+      this.clearBugWaypointState(bugId);
+      this.pfOptions?.onRimWallBlock?.();
+      return;
+    }
+
     state.waypoints.push(position.clone());
     if (terminal) {
       state.waypointTerminalPlaced = true;
       if (state.selectionCircle?.parent) state.selectionCircle.parent.remove(state.selectionCircle);
       state.selectionCircle = null;
-      this.activeRoutingBugId = null;
+      this.setActiveRoutingBugId(null);
     }
     if (!state.waypointMarkersGroup) {
       state.waypointMarkersGroup = new THREE.Group();
@@ -1392,7 +1482,7 @@ export class Scene {
     this.bugRouteStates.delete(bugId);
     this.lastFrameNearPadsByBug.delete(bugId);
     if (this.activeRoutingBugId === bugId) {
-      this.activeRoutingBugId = null;
+      this.setActiveRoutingBugId(null);
       if (this.connectingLine) {
         this.scene.remove(this.connectingLine);
         this.connectingLine.geometry.dispose();
@@ -1412,7 +1502,7 @@ export class Scene {
       (this.connectingLine.material as THREE.Material).dispose();
       this.connectingLine = null;
     }
-    this.activeRoutingBugId = null;
+    this.setActiveRoutingBugId(null);
   }
 
   private selectBugForWaypoints(bugId: string): void {
@@ -1430,7 +1520,7 @@ export class Scene {
       };
       this.bugRouteStates.set(bugId, state);
     }
-    this.activeRoutingBugId = bugId;
+    this.setActiveRoutingBugId(bugId);
     const radius = this.getBugLength(bug);
     if (!state.selectionCircle) {
       state.selectionCircle = this.createSelectionCircle(radius);
@@ -1610,8 +1700,10 @@ export class Scene {
   }
 
   private checkDockAtPad(): void {
-    if (!this.pfOptions?.onDockAtPad) return;
-    this.bugRouteStates.forEach((_, bugId) => {
+    this.bugRouteStates.forEach((routeState, bugId) => {
+      // Only transfer at a terminal waypoint (the final destination), not while passing through.
+      if (!routeState.waypointTerminalPlaced || routeState.waypoints.length !== 1) return;
+
       const bug = this.buggies.get(bugId);
       if (!bug) return;
       bug.getWorldPosition(this.tempVec3);
@@ -1634,44 +1726,19 @@ export class Scene {
         const state = isCS ? this.getRackState(rackId) : (facilityId ? this.getFacilityState(facilityId) : this.getRackState(rackId));
         let loadCharged: number;
         let acceptDrained: number;
-        let question1: string;
-        let question2: string;
         if (isCS) {
           const nFullToBug = Math.min(state.charged, room);
           const mDrainedToStation = Math.min(inv.drained, state.empty + nFullToBug);
           loadCharged = nFullToBug;
           acceptDrained = mDrainedToStation;
-          question1 = `Transfer ${mDrainedToStation} drained batteries from the bug to the charging station?`;
-          question2 = `Transfer ${nFullToBug} full batteries from the charging station to the bug?`;
         } else {
           const nDrainedToBug = Math.min(state.drained, room);
           const mFullToRack = Math.min(inv.charged, state.empty + nDrainedToBug);
           loadCharged = mFullToRack;
           acceptDrained = nDrainedToBug;
-          question1 = `Transfer ${nDrainedToBug} drained batteries from the rack to the bug?`;
-          question2 = `Transfer ${mFullToRack} full batteries from the bug to the rack?`;
         }
-        let reason: string | undefined;
-        if (loadCharged === 0 && acceptDrained === 0) {
-          if (isCS) {
-            if (total >= BUG_MAX_BATTERIES && inv.drained === 0) reason = 'Bug cannot carry more; bug has no drained to transfer.';
-            else if (total >= BUG_MAX_BATTERIES) reason = 'Bug cannot carry more batteries.';
-            else if (state.charged === 0 && state.empty === 0) reason = 'Charging station has no full batteries and no empty slots.';
-            else if (state.charged === 0) reason = 'Charging station has no full batteries.';
-            else if (inv.drained === 0) reason = 'Bug has no drained batteries to transfer.';
-            else reason = 'Charging station has no empty slots.';
-          } else {
-            if (state.drained === 0) reason = 'This location has no drained batteries.';
-            else if (total >= BUG_MAX_BATTERIES) reason = 'Bug cannot carry more batteries.';
-            else reason = 'Nothing to transfer at this location.';
-          }
-        }
-        this.pfOptions.onDockAtPad(
-          { rackId, bugId, loadCharged, acceptDrained, question1, question2, reason },
-          (loadYes, acceptYes) => {
-            this.dockAtPad(rackId, bugId, loadCharged, acceptDrained, loadYes, acceptYes);
-          }
-        );
+        // Auto-answer yes to both transfer questions.
+        this.dockAtPad(rackId, bugId, loadCharged, acceptDrained, true, true);
         this.lastFrameNearPadsByBug.set(bugId, new Set(currentNear));
         return;
       }
@@ -1725,7 +1792,7 @@ export class Scene {
         }
         const BUGGY_PADS = ['VehicleBayPad1', 'VehicleBayPad2', 'VehicleBayPad3', 'VehicleBayPad4'] as const;
         const buggyIds = ['bug1', 'bug2', 'bug3', 'bug4'] as const;
-        const buggyRotations = [Math.PI / 2, Math.PI / 2, 0, 0]; // bug1,bug2: 90° left; bug3,bug4: 180° from that (facing the other way)
+        const buggyRotations = [Math.PI / 2, Math.PI / 2, 0, 0];
         for (let i = 0; i < 4; i++) {
           const group = i === 0 ? gltf.scene : gltf.scene.clone(true);
           group.name = buggyIds[i];
@@ -1735,6 +1802,7 @@ export class Scene {
           this.positionBuggyOnPad(BUGGY_PADS[i], group);
           this.scene.add(group);
           this.buggies.set(buggyIds[i], group);
+          this.bugStartPads.set(buggyIds[i], { padName: BUGGY_PADS[i], rotation: buggyRotations[i] });
         }
       },
       undefined,
@@ -2011,6 +2079,7 @@ export class Scene {
         createBatteryRack: this.createBatteryRack.bind(this),
         removeBatteryRack: this.removeBatteryRack.bind(this),
         setFacilityFailed: this.setFacilityFailed.bind(this),
+        resetSimulation: this.resetSimulation.bind(this),
         refreshBatteryMaterials: this.refreshBatteryMaterials.bind(this),
         getRackState: this.getRackState.bind(this),
         getBugInventory: this.getBugInventory.bind(this),

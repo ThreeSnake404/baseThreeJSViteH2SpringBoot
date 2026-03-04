@@ -5,7 +5,6 @@ import {
   type CameraInfo,
   type CameraParams,
   type HoverInfo,
-  type DockAtPadParams,
 } from './three/Scene';
 import { BatteryRack } from './BatteryRack';
 import {
@@ -20,6 +19,14 @@ const MIN_WINDOW_HEIGHT = 587;
 const CARDS_COLUMN_WIDTH = 316;
 const TEXT_PANEL_WIDTH = 278;
 const LOCATION_COOLDOWN_MS = 10 * 60 * 1000;
+
+const FACILITY_DISPLAY_NAMES: Record<string, string> = {
+  GreenHouse1: 'Green House 1',
+  GreenHouse2: 'Green House 2',
+  IceMine1: 'Ice Mine 1',
+  IceMine2: 'Ice Mine 2',
+  ChargingStation: 'Charging Station',
+};
 
 const LOCATION_DESCRIPTIONS: Array<{ key: string; match: (label: string) => boolean; text: string }> = [
   {
@@ -116,14 +123,21 @@ function App() {
   const setCameraRef = useRef<((params: CameraParams) => void) | null>(null);
   const batteryApiRef = useRef<import('./three/Scene').BatteryApi | null>(null);
   const [hoverInfo, setHoverInfo] = useState<HoverInfo>(null);
-  const [simulationRunning, setSimulationRunning] = useState(true);
+  const [simulationRunning, setSimulationRunning] = useState(false);
   const simulationStartTimeRef = useRef<number>(0);
-  const [dockParams, setDockParams] = useState<DockAtPadParams | null>(null);
-  const [dockLoadYes, setDockLoadYes] = useState<boolean | null>(null);
-  const [selectedCrew, setSelectedCrew] = useState<CrewId>('bowman');
-  const [loggedInCrewIds, setLoggedInCrewIds] = useState<CrewId[]>([]);
+  /** Which crew member THIS page has successfully registered as (null = none). */
+  const [myCrewId, setMyCrewId] = useState<CrewId | null>(null);
+  /** Ref kept in sync with myCrewId so async ping-timeout callbacks read fresh value. */
+  const myCrewIdRef = useRef<CrewId | null>(null);
+  myCrewIdRef.current = myCrewId;
+  /** Set of crew IDs that currently have an active session (from server broadcasts). */
+  const [activeCrewIds, setActiveCrewIds] = useState<Set<CrewId>>(new Set());
+  /** Client-side ping timeout: fires if no ping arrives within 15 seconds. */
+  const pingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Ref to always-fresh WS message handler (updated each render to avoid stale closures). */
+  const wsMessageHandlerRef = useRef<(data: string) => void>(() => {});
   const [messageText, setMessageText] = useState('');
-  const typewriterQueueRef = useRef('Welcome to the Artemis Virtual Training Academy. You have been selected to train with this simulation to become familiar with the Lunar output operations.');
+  const typewriterQueueRef = useRef('Welcome to the Artemis Virtual Training Academy. You have been selected to train with this simulation to become familiar with the Lunar output operations.\n\nTo begin, select an astronaut by clicking their image button on the left panel. The simulation will start automatically once at least one crew member is logged in.');
   const typewriterIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const textScrollRef = useRef<HTMLDivElement>(null);
 
@@ -207,23 +221,69 @@ function App() {
     if (typeof window !== 'undefined') window.resizeTo(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT);
   }, []);
 
-  const fetchLoggedInCrew = useCallback(async () => {
-    try {
-      const r = await fetch(`${API_BASE || ''}/api/crew-logins`);
-      if (r.ok) {
-        const ids = (await r.json()) as string[];
-        setLoggedInCrewIds(ids.filter((id): id is CrewId => ['bowman', 'poole', 'kimball', 'hal'].includes(id)));
-      }
-    } catch {
-      setLoggedInCrewIds([]);
-    }
-  }, []);
+  const VALID_CREW_IDS = ['bowman', 'poole', 'kimball', 'hal'] as const;
+  const CREW_LABELS: Record<CrewId, string> = { bowman: 'Bowman', poole: 'Poole', kimball: 'Kimball', hal: 'HAL 9000' };
 
+  /** Resets (or starts) the 15-second client-side ping watchdog for this page's crew. */
+  const resetPingTimer = useCallback((crewId: CrewId) => {
+    if (pingTimerRef.current) clearTimeout(pingTimerRef.current);
+    pingTimerRef.current = setTimeout(() => {
+      // No ping received in 15 s — server must be gone or connection lost.
+      const id = myCrewIdRef.current;
+      setMyCrewId(null);
+      setActiveCrewIds((prev) => { const n = new Set(prev); if (id) n.delete(id); return n; });
+      if (id) enqueueMessage(`\n\nWARNING: Lost server connection. ${CREW_LABELS[id]} is now No Signal.`);
+    }, 15_000);
+  }, [enqueueMessage]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keep wsMessageHandlerRef.current fresh on every render so it always closes over current state.
   useEffect(() => {
-    fetchLoggedInCrew();
-  }, [fetchLoggedInCrew]);
+    wsMessageHandlerRef.current = (data: string) => {
+      try {
+        const msg = JSON.parse(data) as Record<string, unknown>;
+        const type = msg.type as string;
 
-  const dockOnAnswerRef = useRef<((loadYes: boolean, acceptYes: boolean) => void) | null>(null);
+        if (type === 'crew_register_response') {
+          const cid = msg.crewId as CrewId;
+          if (msg.status === 'ok') {
+            setMyCrewId(cid);
+            setActiveCrewIds((prev) => new Set([...prev, cid]));
+            resetPingTimer(cid);
+            enqueueMessage(`\n\n${CREW_LABELS[cid] ?? cid} logged in. Simulation will begin shortly.`);
+            // Auto-start simulation on first crew login
+            setSimulationRunning((r) => { if (!r) simulationStartTimeRef.current = Date.now(); return true; });
+          } else if (msg.status === 'already_taken') {
+            enqueueMessage('\n\nWARNING: Someone is already logged in as that user. Try a different astronaut.');
+          }
+
+        } else if (type === 'crew_ping') {
+          const cid = msg.crewId as CrewId;
+          // Only handle ping meant for this page's crew.
+          if (cid === myCrewIdRef.current) {
+            resetPingTimer(cid);
+            wsRef.current?.send(JSON.stringify({ type: 'crew_ping_ack', guid: msg.guid, crewId: cid }));
+          }
+
+        } else if (type === 'crew_status_broadcast') {
+          const active = new Set<CrewId>(
+            (msg.active as string[]).filter((id): id is CrewId => (VALID_CREW_IDS as readonly string[]).includes(id))
+          );
+          setActiveCrewIds(active);
+
+        } else if (type === 'crew_logged_out') {
+          const cid = msg.crewId as CrewId;
+          if (cid === myCrewIdRef.current) {
+            if (pingTimerRef.current) clearTimeout(pingTimerRef.current);
+            setMyCrewId(null);
+            enqueueMessage(`\n\nWARNING: ${CREW_LABELS[cid] ?? cid} session timed out and has been logged out.`);
+          }
+        }
+      } catch {
+        // not JSON — ignore
+      }
+    };
+  }); // no deps — always fresh
+
   pfEnabledRef.current = placementFacilityOn;
 
   const onColorChange = useCallback((currentColor: string, nextColor: string) => {
@@ -266,20 +326,11 @@ function App() {
   }, []);
 
   const locationLastShownRef = useRef<Map<string, number>>(new Map());
+  const isRoutingRef = useRef(false);
 
   const onHoverInfoChange = useCallback((info: HoverInfo) => {
     setHoverInfo(info);
-    const label = info?.label ?? null;
-    if (!label) return;
-    const normalized = label.split('\n')[0].trim();
-    const entry = LOCATION_DESCRIPTIONS.find((d) => d.match(normalized));
-    if (!entry) return;
-    const now = Date.now();
-    const lastShown = locationLastShownRef.current.get(entry.key) ?? 0;
-    if (now - lastShown < LOCATION_COOLDOWN_MS) return;
-    locationLastShownRef.current.set(entry.key, now);
-    enqueueMessage('\n\n' + entry.text);
-  }, [enqueueMessage]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   const applyZoom = (multiplier: number) => {
     const base = initialCameraDistanceRef.current;
@@ -351,16 +402,15 @@ function App() {
         onSelectionChange,
         onCameraChange,
         onHoverInfoChange,
+        onRoutingChange: (isRouting) => { isRoutingRef.current = isRouting; },
+        onRimWallBlock: () => {
+          enqueueMessage('\n\nWARNING: You cannot create a route across the Rim Wall unless it is through a tunnel.');
+        },
         setPositionRef,
         setRotationRef,
         setScaleRef,
         setCameraRef,
         batteryApiRef,
-        onDockAtPad: (params, onAnswer) => {
-          dockOnAnswerRef.current = onAnswer;
-          setDockParams(params);
-          setDockLoadYes(null);
-        },
       }
     );
     scene.start();
@@ -391,7 +441,7 @@ function App() {
         }
       };
       ws.onerror = () => { /* close will follow */ };
-      ws.onmessage = (e) => console.log('WS:', e.data);
+      ws.onmessage = (e) => wsMessageHandlerRef.current(e.data as string);
     };
 
     const initialDelayId = setTimeout(connect, 400);
@@ -466,38 +516,90 @@ function App() {
 
   const drainableFacilities = useMemo(() => getDrainableFacilityBatteries(), []);
   const BATTERY_DRAIN_SEC = 30;
+  const DRAINED_THRESHOLD = 1;
 
+  const failedFacilitiesRef = useRef<Set<string>>(new Set());
+  const gameOverShownRef = useRef(false);
+  const userBatteryFillTimesRef = useRef<Map<string, number>>(new Map());
   const simulationRafRef = useRef<number>(0);
   useEffect(() => {
     if (!simulationRunning || !batteryApiRef.current) return;
     simulationStartTimeRef.current = Date.now();
     const tick = () => {
       if (!batteryApiRef.current) return;
-      const elapsed = (Date.now() - simulationStartTimeRef.current) / 1000;
+      const now = Date.now();
+      const elapsed = (now - simulationStartTimeRef.current) / 1000;
+      const api = batteryApiRef.current;
+
       for (const { facilityId, batteryIds } of drainableFacilities) {
+        // Once failed, stays failed until Restart
+        if (failedFacilitiesRef.current.has(facilityId)) {
+          api.setFacilityFailed(facilityId, true);
+          continue;
+        }
+
         const currentIndex = Math.floor(elapsed / BATTERY_DRAIN_SEC);
         const chargeCurrent =
           currentIndex < batteryIds.length
             ? Math.max(0, 100 * (1 - (elapsed % BATTERY_DRAIN_SEC) / BATTERY_DRAIN_SEC))
             : 0;
-        const api = batteryApiRef.current;
+
         for (let i = 0; i < batteryIds.length; i++) {
           const id = batteryIds[i];
           const current = api.getBatteryCharge(id);
-          if (current !== undefined && current < 0) continue;
-          if (api.isBatteryUserFilled(id)) continue;
+          if (current !== undefined && current < 0) {
+            // Battery is an empty slot — remove stale fill-time tracking
+            userBatteryFillTimesRef.current.delete(id);
+            continue;
+          }
+          if (api.isBatteryUserFilled(id)) {
+            // User-transferred battery: drain independently based on when it was placed
+            if (!userBatteryFillTimesRef.current.has(id)) {
+              userBatteryFillTimesRef.current.set(id, now);
+            }
+            const age = (now - userBatteryFillTimesRef.current.get(id)!) / 1000;
+            const c = Math.max(0, 100 * (1 - age / BATTERY_DRAIN_SEC));
+            api.setBatteryCharge(id, c);
+            continue;
+          }
           const c = i < currentIndex ? 0 : i === currentIndex ? chargeCurrent : 100;
           api.setBatteryCharge(id, c);
         }
-        if (currentIndex >= batteryIds.length) {
-          batteryApiRef.current.setFacilityFailed(facilityId, true);
+
+        // Skip failure checks for the first 5 seconds — batteries are still initializing
+        if (elapsed < 5) continue;
+
+        // Only check failure once batteries have actually been created
+        const anyExists = batteryIds.some((id) => api.getBatteryCharge(id) !== undefined);
+        if (!anyExists) continue;
+
+        // Failure based on actual battery state, not time
+        const anyCharged = batteryIds.some((id) => {
+          const charge = api.getBatteryCharge(id);
+          if (charge === undefined || charge < 0) return false;
+          return charge > DRAINED_THRESHOLD;
+        });
+
+        if (!anyCharged) {
+          failedFacilitiesRef.current.add(facilityId);
+          api.setFacilityFailed(facilityId, true);
+          const displayName = FACILITY_DISPLAY_NAMES[facilityId] ?? facilityId;
+          enqueueMessage(`\n\nDANGER: You have just lost ${displayName} because of zero batteries available. This facility cannot be restored until the simulation is restarted.`);
         }
       }
+
+      // Check if all drainable facilities are now failed
+      if (!gameOverShownRef.current &&
+          drainableFacilities.every(({ facilityId }) => failedFacilitiesRef.current.has(facilityId))) {
+        gameOverShownRef.current = true;
+        enqueueMessage('\n\nDANGER: You have lost food, air, and water facilities. This ends the simulation. Press Restart to begin again.');
+      }
+
       simulationRafRef.current = requestAnimationFrame(tick);
     };
     simulationRafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(simulationRafRef.current);
-  }, [simulationRunning, drainableFacilities]);
+  }, [simulationRunning, drainableFacilities, enqueueMessage]);
 
   const inputStyle: React.CSSProperties = {
     width: 56,
@@ -615,19 +717,24 @@ function App() {
           {placementFacilityOn && (
             <button
               type="button"
-              onClick={() => setSimulationRunning(true)}
-              disabled={simulationRunning}
+              onClick={() => {
+                if (activeCrewIds.size === 0) return;
+                simulationStartTimeRef.current = Date.now();
+                setSimulationRunning(true);
+              }}
+              disabled={simulationRunning || activeCrewIds.size === 0}
+              title={activeCrewIds.size === 0 ? 'At least one astronaut must be logged in to start the simulation' : undefined}
               style={{
                 padding: '4px 10px',
                 fontSize: 12,
                 borderRadius: 4,
                 border: '1px solid #555',
-                background: simulationRunning ? '#333' : '#444',
-                color: '#eee',
-                cursor: simulationRunning ? 'default' : 'pointer',
+                background: simulationRunning ? '#333' : activeCrewIds.size === 0 ? '#222' : '#444',
+                color: activeCrewIds.size === 0 ? '#666' : '#eee',
+                cursor: simulationRunning || activeCrewIds.size === 0 ? 'default' : 'pointer',
               }}
             >
-              {simulationRunning ? 'Simulation running…' : 'Start simulation'}
+              {simulationRunning ? 'Simulation running…' : activeCrewIds.size === 0 ? 'Awaiting crew login…' : 'Start simulation'}
             </button>
           )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -639,8 +746,8 @@ function App() {
           { id: 'hal' as CrewId, src: '/models/EyeShot.png', alt: 'HAL 9000', label: 'HAL 9000' },
         ] as const
       ).map(({ id, src, alt, label }) => {
-        const connected = loggedInCrewIds.includes(id);
-        const selected = selectedCrew === id;
+        const connected = activeCrewIds.has(id);
+        const selected = myCrewId === id;
         return (
           <div
             key={id}
@@ -662,19 +769,13 @@ function App() {
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', flexShrink: 0 }}>
               <button
                 type="button"
-                onClick={async () => {
-                  setSelectedCrew(id);
-                  try {
-                    await fetch(`${API_BASE || ''}/api/crew-logins`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ crewId: id }),
-                    });
-                    await fetchLoggedInCrew();
-                    enqueueMessage(`\n${label} logged in.`);
-                  } catch {
-                    enqueueMessage(`\n${label} login failed.`);
+                onClick={() => {
+                  const ws = wsRef.current;
+                  if (!ws || ws.readyState !== WebSocket.OPEN) {
+                    enqueueMessage('\n\nWARNING: Not connected to server. Please wait and try again.');
+                    return;
                   }
+                  ws.send(JSON.stringify({ type: 'crew_register', guid: guidRef.current, crewId: id }));
                 }}
                 style={{
                   padding: 4,
@@ -694,10 +795,11 @@ function App() {
                 style={{
                   marginTop: 4,
                   fontSize: 11,
-                  color: connected ? '#0c0' : '#c00',
+                  color: connected ? '#0f0' : '#c00',
+                  fontWeight: connected ? 600 : 400,
                 }}
               >
-                {connected ? 'Connected' : 'No Signal'}
+                {connected ? '● Connected' : '○ No Signal'}
               </span>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 }}>
@@ -843,13 +945,16 @@ function App() {
             zIndex: 0,
           }}
           onClick={() => {
+            if (isRoutingRef.current) return;
             if (!hoverInfo?.label) return;
             const normalized = hoverInfo.label.split('\n')[0].trim();
             const entry = LOCATION_DESCRIPTIONS.find((d) => d.match(normalized));
             if (!entry) return;
-            locationLastShownRef.current.delete(entry.key);
+            const clickNow = Date.now();
+            const lastShown = locationLastShownRef.current.get(entry.key) ?? 0;
+            if (clickNow - lastShown < LOCATION_COOLDOWN_MS) return;
+            locationLastShownRef.current.set(entry.key, clickNow);
             enqueueMessage('\n\n' + entry.text);
-            locationLastShownRef.current.set(entry.key, Date.now());
           }}
         >
           <canvas
@@ -878,10 +983,13 @@ function App() {
         <div
           ref={(el) => {
             if (!el) return;
-            const canvasRight = window.innerWidth - TEXT_PANEL_WIDTH;
             const rect = el.getBoundingClientRect();
+            const canvasRight = window.innerWidth - TEXT_PANEL_WIDTH;
             if (rect.right > canvasRight) {
               el.style.left = `${hoverInfo.screenX - rect.width - 12}px`;
+            }
+            if (rect.bottom > window.innerHeight) {
+              el.style.top = `${hoverInfo.screenY - rect.height - 12}px`;
             }
           }}
           style={{
@@ -900,97 +1008,6 @@ function App() {
           }}
         >
           {hoverInfo.label}
-        </div>
-      )}
-      {dockParams && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0,0,0,0.6)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 3000,
-          }}
-        >
-          <div
-            style={{
-              background: '#2a2a2a',
-              padding: 20,
-              borderRadius: 8,
-              border: '1px solid #555',
-              minWidth: 280,
-            }}
-          >
-            <p style={{ margin: '0 0 8px', color: '#eee', fontSize: 14 }}>
-              {dockParams.question1}
-            </p>
-            <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-              <button type="button" onClick={() => setDockLoadYes(true)} style={{ padding: '6px 14px', cursor: 'pointer' }}>
-                Yes
-              </button>
-              <button type="button" onClick={() => setDockLoadYes(false)} style={{ padding: '6px 14px', cursor: 'pointer' }}>
-                No
-              </button>
-            </div>
-            <p style={{ margin: '0 0 8px', color: '#eee', fontSize: 14 }}>
-              {dockParams.question2}
-            </p>
-            <div style={{ display: 'flex', gap: 8, marginBottom: dockParams.reason ? 12 : 0 }}>
-              <button
-                type="button"
-                onClick={() => {
-                  dockOnAnswerRef.current?.(dockLoadYes ?? false, true);
-                  setDockParams(null);
-                  dockOnAnswerRef.current = null;
-                }}
-                style={{ padding: '6px 14px', cursor: 'pointer' }}
-              >
-                Yes
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  dockOnAnswerRef.current?.(dockLoadYes ?? false, false);
-                  setDockParams(null);
-                  dockOnAnswerRef.current = null;
-                }}
-                style={{ padding: '6px 14px', cursor: 'pointer' }}
-              >
-                No
-              </button>
-            </div>
-            {dockParams.reason && (
-              <p style={{ margin: '0 0 12px', color: '#aaa', fontSize: 12 }}>
-                {dockParams.reason}
-              </p>
-            )}
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 }}>
-              <button
-                type="button"
-                onClick={() => {
-                  dockOnAnswerRef.current?.(dockLoadYes ?? false, false);
-                  setDockParams(null);
-                  dockOnAnswerRef.current = null;
-                }}
-                style={{ padding: '6px 14px', cursor: 'pointer' }}
-              >
-                Done
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  dockOnAnswerRef.current?.(false, false);
-                  setDockParams(null);
-                  dockOnAnswerRef.current = null;
-                }}
-                style={{ padding: '6px 14px', cursor: 'pointer' }}
-              >
-                Close
-              </button>
-            </div>
-          </div>
         </div>
       )}
       </div>
@@ -1063,6 +1080,31 @@ function App() {
                 }}
               >
                 Clear
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!batteryApiRef.current) return;
+                  batteryApiRef.current.resetSimulation();
+                  failedFacilitiesRef.current.clear();
+                  gameOverShownRef.current = false;
+                  userBatteryFillTimesRef.current.clear();
+                  simulationStartTimeRef.current = Date.now();
+                  typewriterQueueRef.current = '\nSimulation restarted. All systems nominal.';
+                  setMessageText('');
+                }}
+                style={{
+                  padding: '6px 12px',
+                  fontSize: 12,
+                  cursor: 'pointer',
+                  border: '1px solid #555',
+                  borderRadius: 4,
+                  background: '#444',
+                  color: '#eee',
+                  fontFamily: 'Courier, monospace',
+                }}
+              >
+                Restart
               </button>
               <button
                 type="button"
