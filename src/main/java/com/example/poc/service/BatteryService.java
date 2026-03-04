@@ -285,7 +285,7 @@ public class BatteryService {
     @Transactional
     public synchronized TransferResult performTransfer(String bugN, String rackId, Instant now) {
         String facilityId = RACK_TO_FACILITY.get(rackId);
-        if (facilityId == null) return new TransferResult(List.of(), new BugInventory(0, 0));
+        if (facilityId == null) return new TransferResult(List.of(), new BugInventory(0, 0), 0);
 
         boolean isCS = "ChargingStation".equals(facilityId);
 
@@ -310,6 +310,7 @@ public class BatteryService {
 
         Set<String> affectedRacks = new HashSet<>();
         affectedRacks.add(rackId);
+        int batteriesDeliveredToFacility = 0;
 
         if (isCS) {
             // Step 1 (CS): CS → Bug — take fully-charged batteries from the CS rack first.
@@ -408,13 +409,14 @@ public class BatteryService {
                     batteryRepository.save(b);
                     occupiedBugSlots.remove(oldBugSlot);
                     occupiedRackSlots.add(rackSlot);
+                    batteriesDeliveredToFacility++;
                 }
             }
             affectedRacks.add(rackId);
         }
 
         BugInventory inv = getBugInventory(bugN, now);
-        return new TransferResult(new ArrayList<>(affectedRacks), inv);
+        return new TransferResult(new ArrayList<>(affectedRacks), inv, batteriesDeliveredToFacility);
     }
 
     private int nextBugSlot(Set<Integer> occupied) {
@@ -429,5 +431,5 @@ public class BatteryService {
     public record SlotInfo(int slot, double charge) {}
     public record RackInfo(String rackId, List<SlotInfo> slots) {}
     public record BugInventory(int charged, int drained) {}
-    public record TransferResult(List<String> affectedRackIds, BugInventory bugInventory) {}
+    public record TransferResult(List<String> affectedRackIds, BugInventory bugInventory, int batteriesDeliveredToFacility) {}
 }

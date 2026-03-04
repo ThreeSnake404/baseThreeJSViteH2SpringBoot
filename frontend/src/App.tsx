@@ -121,6 +121,8 @@ function App() {
   const setCameraRef = useRef<((params: CameraParams) => void) | null>(null);
   const batteryApiRef = useRef<import('./three/Scene').BatteryApi | null>(null);
   const routingApiRef = useRef<RoutingApi | null>(null);
+  /** Tracks whether the intro bug strobes have been started (should happen exactly once). */
+  const bugStrobesStartedRef = useRef(false);
   /** Bugs reserved by THIS page's session (we send the clear messages for these). */
   const myRoutingBugsRef = useRef<Set<string>>(new Set());
   const [hoverInfo, setHoverInfo] = useState<HoverInfo>(null);
@@ -139,7 +141,23 @@ function App() {
   /** Ref to always-fresh WS message handler (updated each render to avoid stale closures). */
   const wsMessageHandlerRef = useRef<(data: string) => void>(() => {});
   const [messageText, setMessageText] = useState('');
-  const typewriterQueueRef = useRef('Welcome to the Artemis Virtual Training Academy. You have been selected to train with this simulation to become familiar with the Lunar output operations.\n\nTo begin, select an astronaut by clicking their image button on the left panel. The simulation will start automatically once at least one crew member is logged in.');
+  const typewriterQueueRef = useRef(
+    'Welcome to the Artemis Virtual Training Academy. You have been selected to train with this simulation to become familiar with the Lunar output operations.' +
+    '\n\nTo begin, select an astronaut by clicking their image button on the left panel.' +
+    ' The simulation will start automatically once at least one crew member is logged in.' +
+    ' The Bug vehicles on the map will flash green to help you find them.' +
+    ' Once logged in, right-click a Bug to select it, then right-click on the map to place waypoints along its planned route.' +
+    ' Left-click to place the final terminal waypoint that dispatches the Bug along its path.' +
+    '\n\nBug vehicles can carry batteries.' +
+    ' When you see a battery at a location flashing red, that battery is drained.' +
+    ' Right-click a Bug to route it to that location and it will automatically pick up the drained batteries.' +
+    ' Route the Bug to the Charging Station and it will swap them for fully charged ones.' +
+    ' Then route the Bug back to the location to drop off the fresh batteries.' +
+    ' Do not let any location drain all of its batteries or the facility will fail to operate.' +
+    '\n\nYou can hover the mouse over any object on the map to see its name and a description here in this window.' +
+    ' Left-click on any object to repeat its description at any time.'
+  );
+  const loginRoutingWarnedAtRef = useRef<number>(0);
   const typewriterIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const textScrollRef = useRef<HTMLDivElement>(null);
 
@@ -148,13 +166,13 @@ function App() {
   }, []);
 
   useEffect(() => {
-    // 170 words/minute ≈ 1020 chars/minute = 1 char every 59ms
+    // 340 words/minute ≈ 2040 chars/minute = 1 char every 29ms (2× the previous 170 wpm)
     typewriterIntervalRef.current = setInterval(() => {
       if (typewriterQueueRef.current.length === 0) return;
       const chunk = typewriterQueueRef.current.slice(0, 1);
       typewriterQueueRef.current = typewriterQueueRef.current.slice(1);
       setMessageText((prev) => prev + chunk);
-    }, 59);
+    }, 29);
     return () => {
       if (typewriterIntervalRef.current) clearInterval(typewriterIntervalRef.current);
     };
@@ -169,6 +187,7 @@ function App() {
   const [manualOn, setManualOn] = useState(false);
   const [missions, setMissions] = useState<Record<CrewId, number>>({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
   const [cellsDelivered, setCellsDelivered] = useState<Record<CrewId, number>>({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
+  const [wheelWear, setWheelWear] = useState<Record<CrewId, number>>({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
   const [windowSize, setWindowSize] = useState(() =>
     typeof window !== 'undefined' ? { width: window.innerWidth, height: window.innerHeight } : { width: 0, height: 0 }
   );
@@ -249,7 +268,14 @@ function App() {
           const cid = msg.crewId as CrewId;
           if (msg.status === 'ok') {
             setMyCrewId(cid);
-            setActiveCrewIds((prev) => new Set([...prev, cid]));
+            setActiveCrewIds((prev) => {
+              const isFirst = prev.size === 0;
+              if (isFirst && !bugStrobesStartedRef.current) {
+                bugStrobesStartedRef.current = true;
+                routingApiRef.current?.startBugStrobes();
+              }
+              return new Set([...prev, cid]);
+            });
             resetPingTimer(cid);
             enqueueMessage(`\n\n${CREW_LABELS[cid] ?? cid} logged in. Simulation will begin shortly.`);
             // Auto-start simulation on first crew login; also tell server to initialize batteries
@@ -388,6 +414,42 @@ function App() {
         } else if (type === 'SimulationReset') {
           // Server confirmed reset — clear visual state (battery charges come via SimulationStateSync)
           batteryApiRef.current?.resetSimulation();
+          setMissions({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
+          setCellsDelivered({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
+          setWheelWear({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
+
+        } else if (type === 'AstStatsUpdate') {
+          const stats = msg.stats as Record<string, {
+            routes: number;
+            batteries: number;
+            regolithDistance: number;
+            shinyBlueDistance: number;
+          }>;
+          setMissions(prev => {
+            const next = { ...prev };
+            for (const id of (['bowman', 'poole', 'kimball', 'hal'] as CrewId[])) {
+              if (stats[id]) next[id] = stats[id].routes;
+            }
+            return next;
+          });
+          setCellsDelivered(prev => {
+            const next = { ...prev };
+            for (const id of (['bowman', 'poole', 'kimball', 'hal'] as CrewId[])) {
+              if (stats[id]) next[id] = stats[id].batteries;
+            }
+            return next;
+          });
+          setWheelWear(prev => {
+            const next = { ...prev };
+            for (const id of (['bowman', 'poole', 'kimball', 'hal'] as CrewId[])) {
+              if (stats[id]) {
+                const r = stats[id].regolithDistance;
+                const s = stats[id].shinyBlueDistance;
+                next[id] = (r + s) > 0 ? Math.round((r / (r + s)) * 100) : 0;
+              }
+            }
+            return next;
+          });
         }
       } catch {
         // not JSON — ignore
@@ -523,20 +585,37 @@ function App() {
           enqueueMessage('\n\nWARNING: You cannot create a route across the Rim Wall unless it is through a tunnel.');
         },
         onBugReserveRequest: (bugN, x, y, z) => {
+          if (!myCrewIdRef.current) {
+            const now = Date.now();
+            if (now - loginRoutingWarnedAtRef.current >= 10 * 60 * 1000) {
+              loginRoutingWarnedAtRef.current = now;
+              enqueueMessage('\n\nWARNING: You must log in as an astronaut before routing a bug.');
+            }
+            return;
+          }
           const ws = wsRef.current;
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
-          ws.send(JSON.stringify({ type: 'ReserveBug', guid: guidRef.current, crewId: myCrewIdRef.current ?? 'observer', bugN, x, y, z }));
+          ws.send(JSON.stringify({ type: 'ReserveBug', guid: guidRef.current, crewId: myCrewIdRef.current, bugN, x, y, z }));
         },
         onWaypointPlaceRequest: (bugN, x, y, z, terminal) => {
           const ws = wsRef.current;
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
           ws.send(JSON.stringify({ type: 'RequestToPlaceWaypoint', guid: guidRef.current, crewId: myCrewIdRef.current ?? 'observer', bugN, x, y, z, terminal }));
         },
-        onWaypointCleared: (bugN, terminal) => {
+        onWaypointCleared: (bugN, terminal, terrainStats) => {
           const ws = wsRef.current;
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
           if (terminal) {
             ws.send(JSON.stringify({ type: 'RequestToClearTerminalWaypoint', guid: guidRef.current, bugN }));
+            // Send terrain stats separately so the server can credit wheel wear to this AST.
+            if (terrainStats && myCrewIdRef.current) {
+              ws.send(JSON.stringify({
+                type: 'RouteTerrainStats',
+                crewId: myCrewIdRef.current,
+                regolithDistance:  terrainStats.regolithDistance,
+                shinyBlueDistance: terrainStats.shinyBlueDistance,
+              }));
+            }
           } else {
             ws.send(JSON.stringify({ type: 'RequestToClearWaypoint', guid: guidRef.current, bugN }));
           }
@@ -860,10 +939,10 @@ function App() {
                 {connected ? '● Connected' : '○ No Signal'}
               </span>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 13, fontWeight: 600 }}>{label}</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-                <span style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap' }}>Number of Missions:</span>
+                <span style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap' }}>Number of Routes:</span>
                 <input
                   type="text"
                   readOnly
@@ -888,6 +967,26 @@ function App() {
                   type="text"
                   readOnly
                   value={cellsDelivered[id]}
+                  style={{
+                    width: 36,
+                    flexShrink: 0,
+                    padding: '2px 4px',
+                    fontSize: 12,
+                    background: '#222',
+                    color: '#eee',
+                    border: '1px solid #444',
+                    borderRadius: 2,
+                    textAlign: 'right',
+                    fontFamily: 'Courier, monospace',
+                  }}
+                />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                <span style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap' }}>Bug Wheel Wear:</span>
+                <input
+                  type="text"
+                  readOnly
+                  value={`${wheelWear[id]}%`}
                   style={{
                     width: 36,
                     flexShrink: 0,

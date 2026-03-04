@@ -35,7 +35,7 @@ const RACK_BATTERY_X_OFFSETS: [number, number, number, number] = [
 ];
 
 /** Bug waypoint: speed and arrival threshold. */
-const BUG_WAYPOINT_SPEED = 2;
+const BUG_WAYPOINT_SPEED = 1;
 const BUG_WAYPOINT_ARRIVAL = 0.15;
 const GROUND_PLANE_Y = 0.1;
 /** Y-rotation offset so bug front (blue capsule) points toward waypoint; back (3x3 boxes) is opposite. */
@@ -156,6 +156,8 @@ export type RoutingApi = {
    * bugs whose routes completed before they connected).
    */
   receiveBugPositionSync: (bugN: string, x: number, z: number) => void;
+  /** Starts the intro green strobe on all bugs. Call once when the first AST logs in. */
+  startBugStrobes: () => void;
 };
 
 export type PlacementFacilityOptions = {
@@ -168,8 +170,9 @@ export type PlacementFacilityOptions = {
   onBugReserveRequest?: (bugN: string, x: number, y: number, z: number) => void;
   /** Called when the routing owner places a waypoint — tells App.tsx to send RequestToPlaceWaypoint. */
   onWaypointPlaceRequest?: (bugN: string, x: number, y: number, z: number, terminal: boolean) => void;
-  /** Called when the routing owner's bug reaches a waypoint — tells App.tsx to send the clear request. */
-  onWaypointCleared?: (bugN: string, terminal: boolean) => void;
+  /** Called when the routing owner's bug reaches a waypoint — tells App.tsx to send the clear request.
+   *  For terminal waypoints, terrainStats carries regolith/shinyBlue distances for the whole route. */
+  onWaypointCleared?: (bugN: string, terminal: boolean, terrainStats?: { regolithDistance: number; shinyBlueDistance: number }) => void;
   /** Called when the routing owner cancels a route (ESC key or RimWall block).
    *  x/y/z are the bug's current world position so other clients can sync the bug's location. */
   onRouteCancelled?: (bugN: string, x: number, y: number, z: number) => void;
@@ -234,6 +237,12 @@ export class Scene {
       waypointMarkerObjects: THREE.Group[];
       /** Per-bug line: shows bug→waypoints path and rubber-band to mouse for the active bug. */
       routeLine: THREE.Line | null;
+      /** Tail of the last placed waypoint (or bug start) used as "from" for terrain sampling. */
+      lastSegmentEnd: THREE.Vector3 | null;
+      /** Accumulated Regolith distance for this route (world units). */
+      regolithDistance: number;
+      /** Accumulated ShinyBlue distance for this route (world units). */
+      shinyBlueDistance: number;
     }
   >();
   /** Who reserved each bug: guid + crewId of the reserving session. */
@@ -252,6 +261,9 @@ export class Scene {
   private readonly waypointLinePoints: THREE.Vector3[] = [];
   /** Bug battery inventory cache — updated via updateBugInventory from server BugInventoryUpdate messages. */
   private readonly bugInventory = new Map<string, { charged: number; drained: number }>();
+  /** Strobing green disk meshes shown over each bug at startup; cleared on first bug right-click. */
+  private readonly bugStrobeMeshes = new Map<string, THREE.Mesh>();
+  private strobesActive = false;
   private readonly bugStartPads = new Map<string, { padName: string; rotation: number }>(); 
   private colorIndex = 0;
   private readonly raycaster = new THREE.Raycaster();
@@ -1294,6 +1306,40 @@ export class Scene {
     return Math.max(size.x, size.z);
   }
 
+  /** Creates a pulsing bright-green disk over every bug so new users can spot them. */
+  private createBugStrobes(): void {
+    this.bugStrobeMeshes.clear();
+    this.buggies.forEach((bug, bugId) => {
+      const radius = this.getBugLength(bug) * 0.85;
+      const geom = new THREE.CircleGeometry(radius, 32);
+      geom.rotateX(-Math.PI / 2); // lay flat in XZ plane
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x00ff44,
+        transparent: true,
+        opacity: 0,
+        depthTest: false,
+        side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      bug.getWorldPosition(this.tempVec3);
+      mesh.position.set(this.tempVec3.x, GROUND_PLANE_Y + 0.05, this.tempVec3.z);
+      this.scene.add(mesh);
+      this.bugStrobeMeshes.set(bugId, mesh);
+    });
+    this.strobesActive = true;
+  }
+
+  /** Removes all strobe meshes and stops the pulsing. */
+  private stopBugStrobes(): void {
+    this.strobesActive = false;
+    this.bugStrobeMeshes.forEach((mesh) => {
+      this.scene.remove(mesh);
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+    });
+    this.bugStrobeMeshes.clear();
+  }
+
   private createSelectionCircle(radius: number, color = 0x00ff00): THREE.Group {
     const group = new THREE.Group();
     const ring = new THREE.RingGeometry(radius - 0.03, radius + 0.03, 32);
@@ -1358,10 +1404,73 @@ export class Scene {
     return this.segRaycaster.intersectObject(this.rimWallMesh, true).length > 0;
   }
 
+  /**
+   * Samples a route segment at regular intervals and classifies terrain underneath each sample
+   * point by casting a ray straight down into the shinyPathGroup.
+   * Returns the accumulated Regolith distance and ShinyBlue distance (world units).
+   */
+  private classifySegmentTerrain(
+    from: THREE.Vector3,
+    to: THREE.Vector3,
+  ): { regolith: number; shinyBlue: number } {
+    if (!this.shinyPathGroup) return { regolith: 0, shinyBlue: 0 };
+    const segLen = from.distanceTo(to);
+    if (segLen < 0.001) return { regolith: 0, shinyBlue: 0 };
+
+    const STEP = 0.4; // world-unit sample interval
+    const numSteps = Math.max(1, Math.ceil(segLen / STEP));
+    const stepLen  = segLen / numSteps;
+
+    const ray = new THREE.Raycaster();
+    ray.near = 0;
+    ray.far  = 50;
+    const downDir = new THREE.Vector3(0, -1, 0);
+
+    let regolith  = 0;
+    let shinyBlue = 0;
+
+    for (let i = 0; i <= numSteps; i++) {
+      const t = i / numSteps;
+      const x = from.x + (to.x - from.x) * t;
+      const z = from.z + (to.z - from.z) * t;
+      ray.set(new THREE.Vector3(x, 20, z), downDir);
+      const hits = ray.intersectObject(this.shinyPathGroup, true);
+      if (hits.length === 0) continue;
+
+      // Walk up the hit object's parent chain to find a displayName.
+      let label = '';
+      let obj: THREE.Object3D | null = hits[0].object;
+      while (obj) {
+        const u = obj.userData as Record<string, unknown>;
+        if (typeof u?.displayName === 'string' && u.displayName) {
+          label = u.displayName as string;
+          break;
+        }
+        obj = obj.parent;
+      }
+
+      const portion = stepLen; // each sample "owns" one step's worth of distance
+      if (/regolith/i.test(label)) {
+        regolith  += portion;
+      } else if (/shiny.?blue/i.test(label)) {
+        shinyBlue += portion;
+      }
+    }
+    return { regolith, shinyBlue };
+  }
+
   /** Add a waypoint from a server-broadcast position. RimWall check is done before calling. */
   private addWaypoint(bugId: string, position: THREE.Vector3, terminal: boolean, color = 0x00ff00): void {
     const state = this.bugRouteStates.get(bugId);
     if (!state) return;
+
+    // Accumulate terrain distances for the segment to this waypoint (owner only).
+    if (this.myRoutingBugIds.has(bugId) && state.lastSegmentEnd) {
+      const terrain = this.classifySegmentTerrain(state.lastSegmentEnd, position);
+      state.regolithDistance  += terrain.regolith;
+      state.shinyBlueDistance += terrain.shinyBlue;
+    }
+    state.lastSegmentEnd = position.clone();
 
     state.waypoints.push(position.clone());
     if (terminal) {
@@ -1444,7 +1553,14 @@ export class Scene {
           // Only the routing owner sends the clear request to the server.
           if (this.myRoutingBugIds.has(bugId)) {
             const isTerminal = state.waypoints.length === 1 && state.waypointTerminalPlaced;
-            this.pfOptions?.onWaypointCleared?.(bugId, isTerminal);
+            if (isTerminal) {
+              this.pfOptions?.onWaypointCleared?.(bugId, true, {
+                regolithDistance:  state.regolithDistance,
+                shinyBlueDistance: state.shinyBlueDistance,
+              });
+            } else {
+              this.pfOptions?.onWaypointCleared?.(bugId, false);
+            }
           }
         }
         // Wait here until receiveClearWaypoint / receiveClearTerminalWaypoint is called.
@@ -1611,6 +1727,8 @@ export class Scene {
     const color = Scene.AST_COLORS[crewId] ?? 0x00ff00;
     let state = this.bugRouteStates.get(bugId);
     if (!state) {
+      // Capture the bug's current world position as the start of the first terrain segment.
+      bug.getWorldPosition(this.tempVec3);
       state = {
         waypoints: [],
         waypointTerminalPlaced: false,
@@ -1620,6 +1738,9 @@ export class Scene {
         waypointMarkersGroup: null,
         waypointMarkerObjects: [],
         routeLine: null,
+        lastSegmentEnd: this.tempVec3.clone(),
+        regolithDistance: 0,
+        shinyBlueDistance: 0,
       };
       this.bugRouteStates.set(bugId, state);
     }
@@ -1785,6 +1906,8 @@ export class Scene {
 
     // ── Bug click → send ReserveBug to server ──────────────────────────────
     if (bugIdFromRoot && !this.activeRoutingBugId) {
+      // First right-click on any bug ends the intro strobe.
+      if (this.strobesActive) this.stopBugStrobes();
       const bugObj = this.buggies.get(bugIdFromRoot);
       if (bugObj) {
         const wp = new THREE.Vector3();
@@ -2078,6 +2201,7 @@ export class Scene {
         receiveBugReleased:       this.receiveBugReleased.bind(this),
         receiveRouteStateSync:    this.receiveRouteStateSync.bind(this),
         receiveBugPositionSync:   this.receiveBugPositionSync.bind(this),
+        startBugStrobes:          this.createBugStrobes.bind(this),
       };
     }
     this.loadAxisHelper();
@@ -2168,6 +2292,13 @@ export class Scene {
       this.cubeMesh.rotation.y = t * 0.3;
       this.updateBatteryBlink(t);
       this.updateFacilityFailureOverlays();
+      // Pulse green strobe masks over bugs during the intro phase.
+      if (this.strobesActive) {
+        const pulse = 0.35 + 0.35 * Math.sin((Date.now() / 400) * Math.PI);
+        this.bugStrobeMeshes.forEach((mesh) => {
+          (mesh.material as THREE.MeshBasicMaterial).opacity = pulse;
+        });
+      }
       this.renderer.render(this.scene, this.camera);
     };
     loop();
@@ -2175,6 +2306,7 @@ export class Scene {
 
   dispose(): void {
     this.disposed = true;
+    this.stopBugStrobes();
     this.clearWaypointState();
     this.removeDragAxisLine();
     this.attachRotationHelper(null);

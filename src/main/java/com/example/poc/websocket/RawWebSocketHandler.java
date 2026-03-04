@@ -16,9 +16,11 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
+import com.example.poc.entity.AstStats;
 import com.example.poc.entity.BugInRoute;
 import com.example.poc.entity.Clicked;
 import com.example.poc.entity.CrewLogin;
+import com.example.poc.repository.AstStatsRepository;
 import com.example.poc.repository.BugInRouteRepository;
 import com.example.poc.repository.ClickedRepository;
 import com.example.poc.repository.CrewLoginRepository;
@@ -82,20 +84,25 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
 
     private static final int MAX_BUGS_PER_SESSION = 2;
 
+    private static final String[] ALL_CREW_IDS = {"bowman", "poole", "kimball", "hal"};
+
     private final ClickedRepository    clickedRepository;
     private final CrewLoginRepository  crewLoginRepository;
     private final BugInRouteRepository bugInRouteRepository;
     private final BatteryService       batteryService;
+    private final AstStatsRepository   astStatsRepository;
     private final ObjectMapper         objectMapper = new ObjectMapper();
 
     public RawWebSocketHandler(ClickedRepository clickedRepository,
                                 CrewLoginRepository crewLoginRepository,
                                 BugInRouteRepository bugInRouteRepository,
-                                BatteryService batteryService) {
+                                BatteryService batteryService,
+                                AstStatsRepository astStatsRepository) {
         this.clickedRepository    = clickedRepository;
         this.crewLoginRepository  = crewLoginRepository;
         this.bugInRouteRepository = bugInRouteRepository;
         this.batteryService       = batteryService;
+        this.astStatsRepository   = astStatsRepository;
     }
 
     // ── Connection lifecycle ──────────────────────────────────────────────────
@@ -124,6 +131,7 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         // Send current battery state if simulation is running.
         if (batteryService.isSimulationStarted()) {
             sendSimulationStateSync(session);
+            sendAstStatsUpdate(session);
         }
     }
 
@@ -162,6 +170,7 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
                 case "StartSimulation"                -> handleStartSimulation();
                 case "ResetSimulation"                -> handleResetSimulation();
                 case "QueryBugBatteries"              -> handleQueryBugBatteries(session, json);
+                case "RouteTerrainStats"              -> handleRouteTerrainStats(session, json);
             }
         } catch (Exception e) {
             // invalid JSON — ignore
@@ -314,11 +323,12 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
     }
 
     private void handleRequestToClearTerminalWaypoint(WebSocketSession session, Map<String, Object> json) {
-        String guid = str(json, "guid");
-        String bugN = str(json, "bugN");
+        String guid  = str(json, "guid");
+        String bugN  = str(json, "bugN");
         if (bugN == null) return;
 
         RouteState rs = activeRoutes.remove(bugN);
+        String crewId = rs != null ? rs.crewId : null;
         double termX = 0, termY = 0, termZ = 0;
         if (rs != null) {
             if (!rs.waypoints.isEmpty()) {
@@ -336,20 +346,36 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         });
         removeSessionReservation(session, bugN);
 
-        // Server auto-detects docking and performs battery transfer
+        // Increment route-completed count for the owning AST.
+        int batteriesDelivered = 0;
+        if (crewId != null) {
+            AstStats stats = astStatsRepository.findById(crewId).orElse(new AstStats(crewId));
+            stats.setRoutesCompleted(stats.getRoutesCompleted() + 1);
+            astStatsRepository.save(stats);
+        }
+
+        // Server auto-detects docking and performs battery transfer.
         if (batteryService.isSimulationStarted()) {
             String nearestRack = batteryService.findNearestRack(termX, termZ);
             if (nearestRack != null) {
                 Instant now = Instant.now();
                 BatteryService.TransferResult result = batteryService.performTransfer(bugN, nearestRack, now);
+                batteriesDelivered = result.batteriesDeliveredToFacility();
 
-                // Notify all clients of updated bug inventory
+                // Update batteries_delivered stat for the owning AST.
+                if (crewId != null && batteriesDelivered > 0) {
+                    AstStats stats = astStatsRepository.findById(crewId).orElse(new AstStats(crewId));
+                    stats.setBatteriesDelivered(stats.getBatteriesDelivered() + batteriesDelivered);
+                    astStatsRepository.save(stats);
+                }
+
+                // Notify all clients of updated bug inventory.
                 BatteryService.BugInventory inv = result.bugInventory();
                 broadcast(String.format(
                     "{\"type\":\"BugInventoryUpdate\",\"bugN\":\"%s\",\"charged\":%d,\"drained\":%d}",
                     esc(bugN), inv.charged(), inv.drained()));
 
-                // Notify all clients of updated battery levels for affected racks
+                // Notify all clients of updated battery levels for affected racks.
                 for (String rackId : result.affectedRackIds()) {
                     String facilityId = BatteryService.FACILITY_RACKS.entrySet().stream()
                         .filter(e -> java.util.Arrays.asList(e.getValue()).contains(rackId))
@@ -362,8 +388,23 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
             }
         }
 
+        broadcastAstStatsUpdate();
+
         broadcast(sfmt("{\"type\":\"ResponseToClearTerminalWaypoint\",\"bugN\":\"%s\",\"guid\":\"%s\"}",
             bugN, guid != null ? guid : ""));
+    }
+
+    /** Receives terrain travel distances from the routing client and persists them. */
+    private void handleRouteTerrainStats(WebSocketSession session, Map<String, Object> json) {
+        String crewId          = str(json, "crewId");
+        double regolithDist    = dbl(json, "regolithDistance");
+        double shinyBlueDist   = dbl(json, "shinyBlueDistance");
+        if (crewId == null) return;
+        AstStats stats = astStatsRepository.findById(crewId).orElse(new AstStats(crewId));
+        stats.setRegolithDistance(stats.getRegolithDistance() + regolithDist);
+        stats.setShinyBlueDistance(stats.getShinyBlueDistance() + shinyBlueDist);
+        astStatsRepository.save(stats);
+        broadcastAstStatsUpdate();
     }
 
     // ── Battery management ────────────────────────────────────────────────────
@@ -371,14 +412,26 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
     private void handleStartSimulation() {
         if (!batteryService.isSimulationStarted()) {
             batteryService.initializeSimulation(Instant.now());
+            initAstStats();
             broadcastSimulationStateSync();
+            broadcastAstStatsUpdate();
         }
     }
 
     private void handleResetSimulation() {
         batteryService.resetSimulation();
+        initAstStats();
         broadcastSimulationStateSync();
+        broadcastAstStatsUpdate();
         broadcast("{\"type\":\"SimulationReset\"}");
+    }
+
+    /** Clears and re-creates zeroed rows for all four ASTs. */
+    private void initAstStats() {
+        astStatsRepository.deleteAll();
+        for (String crewId : ALL_CREW_IDS) {
+            astStatsRepository.save(new AstStats(crewId));
+        }
     }
 
     private void handleQueryBugBatteries(WebSocketSession session, Map<String, Object> json) {
@@ -501,6 +554,43 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         msg.put("failedFacilities", new ArrayList<>(batteryService.getFailedFacilities()));
         msg.put("gameOver", batteryService.isGameOver());
 
+        return msg;
+    }
+
+    // ── AST stats helpers ─────────────────────────────────────────────────────
+
+    /** Builds and broadcasts an AstStatsUpdate containing all four ASTs' current stats. */
+    private void broadcastAstStatsUpdate() {
+        try {
+            broadcast(objectMapper.writeValueAsString(buildAstStatsMsg()));
+        } catch (Exception e) {
+            // serialization failure — skip
+        }
+    }
+
+    /** Sends current AST stats to a single newly-connected session. */
+    private void sendAstStatsUpdate(WebSocketSession session) {
+        try {
+            send(session, objectMapper.writeValueAsString(buildAstStatsMsg()));
+        } catch (Exception e) {
+            // serialization failure — skip
+        }
+    }
+
+    private Map<String, Object> buildAstStatsMsg() {
+        Map<String, Object> msg = new LinkedHashMap<>();
+        msg.put("type", "AstStatsUpdate");
+        Map<String, Object> statsMap = new LinkedHashMap<>();
+        for (String crewId : ALL_CREW_IDS) {
+            AstStats s = astStatsRepository.findById(crewId).orElse(new AstStats(crewId));
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("routes",          s.getRoutesCompleted());
+            entry.put("batteries",       s.getBatteriesDelivered());
+            entry.put("regolithDistance",  s.getRegolithDistance());
+            entry.put("shinyBlueDistance", s.getShinyBlueDistance());
+            statsMap.put(crewId, entry);
+        }
+        msg.put("stats", statsMap);
         return msg;
     }
 
