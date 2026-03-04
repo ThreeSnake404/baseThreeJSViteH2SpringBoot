@@ -240,6 +240,11 @@ export class Scene {
     const wasRouting = this.activeRoutingBugId !== null;
     this.activeRoutingBugId = id;
     const isRouting = id !== null;
+    if (isRouting) {
+      // Clear stale mouse position so the rubber-band line does not immediately snap
+      // toward wherever the cursor was before this bug was selected.
+      this.mousePosition3D = null;
+    }
     if (wasRouting !== isRouting) {
       this.pfOptions?.onRoutingChange?.(isRouting);
     }
@@ -256,6 +261,8 @@ export class Scene {
       selectionCircle: THREE.Group | null;
       waypointMarkersGroup: THREE.Group | null;
       waypointMarkerObjects: THREE.Group[];
+      /** Per-bug line: shows bug→waypoints path and rubber-band to mouse for the active bug. */
+      routeLine: THREE.Line | null;
     }
   >();
   /** Who reserved each bug: guid + crewId of the reserving session. */
@@ -271,7 +278,6 @@ export class Scene {
   };
   private readonly groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -GROUND_PLANE_Y);
   private mousePosition3D: THREE.Vector3 | null = null;
-  private connectingLine: THREE.Line | null = null;
   private readonly waypointLinePoints: THREE.Vector3[] = [];
   private lastFrameNearPadsByBug = new Map<string, Set<string>>();
   private readonly tempVec3b = new THREE.Vector3();
@@ -1426,42 +1432,30 @@ export class Scene {
   }
 
   private updateConnectingLine(): void {
-    if (!this.connectingLine) return;
-    let bugId = this.activeRoutingBugId;
-    if (!bugId) {
-      // No active bug; show path for any bug that has waypoints (e.g. just dropped a terminal)
-      for (const [id, state] of this.bugRouteStates) {
-        if (state.waypoints.length > 0) {
-          bugId = id;
-          break;
-        }
+    this.bugRouteStates.forEach((state, bugId) => {
+      const line = state.routeLine;
+      if (!line) return;
+      const bug = this.buggies.get(bugId);
+      if (!bug) { line.visible = false; return; }
+
+      this.waypointLinePoints.length = 0;
+      bug.getWorldPosition(this.tempVec3);
+      this.waypointLinePoints.push(this.tempVec3.clone());
+      for (let i = state.waypointCurrentIndex; i < state.waypoints.length; i++) {
+        this.waypointLinePoints.push(state.waypoints[i].clone());
       }
-    }
-    if (!bugId) {
-      this.connectingLine.visible = false;
-      return;
-    }
-    const state = this.bugRouteStates.get(bugId);
-    const bug = this.buggies.get(bugId);
-    if (!state || !bug) {
-      this.connectingLine.visible = false;
-      return;
-    }
-    this.waypointLinePoints.length = 0;
-    bug.getWorldPosition(this.tempVec3);
-    this.waypointLinePoints.push(this.tempVec3.clone());
-    for (let i = state.waypointCurrentIndex; i < state.waypoints.length; i++) {
-      this.waypointLinePoints.push(state.waypoints[i].clone());
-    }
-    if (!state.waypointTerminalPlaced && this.mousePosition3D) {
-      this.waypointLinePoints.push(this.mousePosition3D.clone());
-    }
-    if (this.waypointLinePoints.length < 2) {
-      this.connectingLine.visible = false;
-      return;
-    }
-    this.connectingLine.geometry.setFromPoints(this.waypointLinePoints);
-    this.connectingLine.visible = true;
+      // Rubber-band to mouse cursor only for the bug actively being routed (no terminal yet).
+      if (!state.waypointTerminalPlaced && bugId === this.activeRoutingBugId && this.mousePosition3D) {
+        this.waypointLinePoints.push(this.mousePosition3D.clone());
+      }
+
+      if (this.waypointLinePoints.length < 2) {
+        line.visible = false;
+      } else {
+        line.geometry.setFromPoints(this.waypointLinePoints);
+        line.visible = true;
+      }
+    });
   }
 
   private removeWaypointAndMarkerAtIndex(bugId: string, index: number): void {
@@ -1532,16 +1526,16 @@ export class Scene {
     }
     this.bugRouteStates.delete(bugId);
     this.lastFrameNearPadsByBug.delete(bugId);
+    if (state.routeLine) {
+      this.scene.remove(state.routeLine);
+      state.routeLine.geometry.dispose();
+      (state.routeLine.material as THREE.Material).dispose();
+      state.routeLine = null;
+    }
     this.routingOwners.delete(bugId);
     this.myRoutingBugIds.delete(bugId);
     if (this.activeRoutingBugId === bugId) {
       this.setActiveRoutingBugId(null);
-      if (this.connectingLine) {
-        this.scene.remove(this.connectingLine);
-        this.connectingLine.geometry.dispose();
-        (this.connectingLine.material as THREE.Material).dispose();
-        this.connectingLine = null;
-      }
     }
   }
 
@@ -1561,6 +1555,12 @@ export class Scene {
   // ── Server-coordinated routing receive methods ────────────────────────────
 
   private receiveRoutingGranted(bugN: string, crewId: string, guid: string): void {
+    // Clear any stale route state from a previous (possibly incomplete) route before initializing
+    // the new one.  Without this, old waypoints and waypointArrivalPending=true can corrupt the
+    // new route, causing the bug to appear frozen from the first frame.
+    if (this.bugRouteStates.has(bugN)) {
+      this.clearBugWaypointState(bugN);
+    }
     this.routingOwners.set(bugN, { guid, crewId });
     const isOwner = guid === this.pfOptions?.pageGuid;
     if (isOwner) this.myRoutingBugIds.add(bugN);
@@ -1649,12 +1649,6 @@ export class Scene {
     }
     const bugIds = Array.from(this.bugRouteStates.keys());
     for (const bugId of bugIds) this.clearBugWaypointState(bugId);
-    if (this.connectingLine) {
-      this.scene.remove(this.connectingLine);
-      this.connectingLine.geometry.dispose();
-      (this.connectingLine.material as THREE.Material).dispose();
-      this.connectingLine = null;
-    }
     this.setActiveRoutingBugId(null);
   }
 
@@ -1677,6 +1671,7 @@ export class Scene {
         selectionCircle: null,
         waypointMarkersGroup: null,
         waypointMarkerObjects: [],
+        routeLine: null,
       };
       this.bugRouteStates.set(bugId, state);
     }
@@ -1692,7 +1687,7 @@ export class Scene {
       state.waypointMarkersGroup = new THREE.Group();
       this.scene.add(state.waypointMarkersGroup);
     }
-    if (!this.connectingLine) {
+    if (!state.routeLine) {
       const lineGeom = new THREE.BufferGeometry();
       const lineMat = new THREE.LineBasicMaterial({
         color,
@@ -1700,8 +1695,8 @@ export class Scene {
         opacity: 0.6,
         depthTest: false,
       });
-      this.connectingLine = new THREE.Line(lineGeom, lineMat);
-      this.scene.add(this.connectingLine);
+      state.routeLine = new THREE.Line(lineGeom, lineMat);
+      this.scene.add(state.routeLine);
     }
   }
 
