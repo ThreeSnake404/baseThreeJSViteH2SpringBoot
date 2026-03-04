@@ -177,6 +177,11 @@ export type RoutingApi = {
     guid: string,
     waypoints: Array<{ x: number; y: number; z: number; terminal: boolean }>,
   ) => void;
+  /**
+   * Teleports a bug to its last known resting position (sent to late-joiners for
+   * bugs whose routes completed before they connected).
+   */
+  receiveBugPositionSync: (bugN: string, x: number, z: number) => void;
 };
 
 export type PlacementFacilityOptions = {
@@ -1584,6 +1589,11 @@ export class Scene {
     this.clearBugWaypointState(bugN);
   }
 
+  private receiveBugPositionSync(bugN: string, x: number, z: number): void {
+    const bug = this.buggies.get(bugN);
+    if (bug) { bug.position.x = x; bug.position.z = z; }
+  }
+
   private receiveBugReleased(bugN: string, x?: number, z?: number): void {
     if (x !== undefined && z !== undefined) {
       const bug = this.buggies.get(bugN);
@@ -1629,6 +1639,14 @@ export class Scene {
 
   private clearWaypointState(): void {
     this.mousePosition3D = null;
+    // Notify the server for any routes owned by this client so other clients can clean up.
+    for (const bugId of this.myRoutingBugIds) {
+      const bug = this.buggies.get(bugId);
+      if (bug) {
+        bug.getWorldPosition(this.tempVec3);
+        this.pfOptions?.onRouteCancelled?.(bugId, this.tempVec3.x, this.tempVec3.y, this.tempVec3.z);
+      }
+    }
     const bugIds = Array.from(this.bugRouteStates.keys());
     for (const bugId of bugIds) this.clearBugWaypointState(bugId);
     if (this.connectingLine) {
@@ -2276,6 +2294,7 @@ export class Scene {
         receiveClearTerminalWaypoint: this.receiveClearTerminalWaypoint.bind(this),
         receiveBugReleased:       this.receiveBugReleased.bind(this),
         receiveRouteStateSync:    this.receiveRouteStateSync.bind(this),
+        receiveBugPositionSync:   this.receiveBugPositionSync.bind(this),
       };
     }
     this.loadAxisHelper();

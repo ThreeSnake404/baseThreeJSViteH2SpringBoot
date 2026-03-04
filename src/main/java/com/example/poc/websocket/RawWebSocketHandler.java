@@ -88,6 +88,9 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
     private final ConcurrentHashMap<WebSocketSession, CrewSessionInfo> crewSessions        = new ConcurrentHashMap<>();
     /** bugN → current route state (only for bugs that are actively routed). */
     private final ConcurrentHashMap<String, RouteState> activeRoutes  = new ConcurrentHashMap<>();
+    /** bugN → last known world position [x, y, z] — persists after a route completes or is cancelled.
+     *  Used to sync bug positions to late-joining clients for routes that are no longer active. */
+    private final ConcurrentHashMap<String, double[]> bugLastPositions = new ConcurrentHashMap<>();
     /** session → set of reserved bugN values; max 2 per session. */
     private final ConcurrentHashMap<WebSocketSession, CopyOnWriteArraySet<String>> sessionBugReservations = new ConcurrentHashMap<>();
 
@@ -117,6 +120,16 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         // can reconstruct the routing visuals and bug positions.
         for (RouteState rs : activeRoutes.values()) {
             sendRouteSyncToSession(session, rs);
+        }
+        // Send final positions for bugs whose routes have already completed or were cancelled,
+        // so late-joiners see them at the correct resting location rather than their spawn point.
+        for (Map.Entry<String, double[]> e : bugLastPositions.entrySet()) {
+            if (!activeRoutes.containsKey(e.getKey())) { // skip if an active RouteStateSync was already sent
+                double[] p = e.getValue();
+                send(session, String.format(
+                    "{\"type\":\"BugPositionSync\",\"bugN\":\"%s\",\"x\":%s,\"y\":%s,\"z\":%s}",
+                    esc(e.getKey()), p[0], p[1], p[2]));
+            }
         }
     }
 
@@ -294,6 +307,7 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         double z = dbl(json, "z");
 
         activeRoutes.remove(bugN);
+        bugLastPositions.put(bugN, new double[]{ x, y, z });
         bugInRouteRepository.findActiveByBugN(bugN).ifPresent(r -> {
             r.setReleasedTime(Instant.now());
             bugInRouteRepository.save(r);
@@ -311,7 +325,18 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         String bugN = str(json, "bugN");
         if (bugN == null) return;
 
-        activeRoutes.remove(bugN);
+        // Capture terminal position before removing from activeRoutes so late-joiners can sync.
+        RouteState rs = activeRoutes.remove(bugN);
+        if (rs != null) {
+            // The terminal waypoint is the last remaining entry in rs.waypoints.
+            if (!rs.waypoints.isEmpty()) {
+                WaypointEntry terminal = rs.waypoints.get(0);
+                bugLastPositions.put(bugN, new double[]{ terminal.x, terminal.y, terminal.z });
+            } else {
+                bugLastPositions.put(bugN, new double[]{ rs.cx, rs.cy, rs.cz });
+            }
+        }
+
         bugInRouteRepository.findActiveByBugN(bugN).ifPresent(r -> {
             r.setReleasedTime(Instant.now());
             bugInRouteRepository.save(r);
@@ -343,7 +368,16 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         CopyOnWriteArraySet<String> reserved = sessionBugReservations.remove(session);
         if (reserved == null || reserved.isEmpty()) return;
         for (String bugN : reserved) {
-            activeRoutes.remove(bugN);
+            RouteState rs = activeRoutes.remove(bugN);
+            // Persist best-known position so late-joiners can still see where the bug was.
+            if (rs != null) {
+                if (!rs.waypoints.isEmpty()) {
+                    WaypointEntry last = rs.waypoints.get(0);
+                    bugLastPositions.put(bugN, new double[]{ last.x, last.y, last.z });
+                } else {
+                    bugLastPositions.put(bugN, new double[]{ rs.cx, rs.cy, rs.cz });
+                }
+            }
             bugInRouteRepository.findActiveByBugN(bugN).ifPresent(r -> {
                 r.setReleasedTime(Instant.now());
                 bugInRouteRepository.save(r);

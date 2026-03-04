@@ -320,6 +320,13 @@ function App() {
           const rz = msg.z != null ? Number(msg.z) : undefined;
           routingApiRef.current?.receiveBugReleased(bugN, rx, rz);
 
+        } else if (type === 'BugPositionSync') {
+          routingApiRef.current?.receiveBugPositionSync(
+            msg.bugN as string,
+            Number(msg.x),
+            Number(msg.z),
+          );
+
         } else if (type === 'RouteStateSync') {
           // Full route-state snapshot sent to this client when it first connects.
           const waypoints = (msg.waypoints as Array<{ x: number; y: number; z: number; terminal: boolean }>) ?? [];
@@ -864,8 +871,8 @@ function App() {
                 style={{
                   padding: 4,
                   borderRadius: 4,
-                  border: '1px solid #888',
-                  background: selected ? '#666' : '#222',
+                  border: selected ? '2px solid #1e90ff' : '1px solid #888',
+                  background: selected ? '#0047ab' : '#222',
                   cursor: 'pointer',
                 }}
               >
