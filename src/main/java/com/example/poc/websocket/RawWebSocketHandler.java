@@ -22,22 +22,16 @@ import com.example.poc.entity.CrewLogin;
 import com.example.poc.repository.BugInRouteRepository;
 import com.example.poc.repository.ClickedRepository;
 import com.example.poc.repository.CrewLoginRepository;
+import com.example.poc.service.BatteryService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
  * WebSocket handler for all real-time communication.
  *
- * Crew login protocol:
- *   client→server: crew_register, crew_ping_ack
- *   server→client: crew_register_response, crew_ping, crew_status_broadcast, crew_logged_out
- *
- * Bug routing protocol:
- *   client→server: ReserveBug, RequestToPlaceWaypoint, RequestToClearWaypoint,
- *                  RequestToClearTerminalWaypoint
- *   server→all:    RoutingRequestGranted, AlreadyReserved (sender only),
- *                  ResponseToPlaceWaypoint, ResponseToClearWaypoint,
- *                  ResponseToClearTerminalWaypoint, BugReservationReleased,
- *                  RouteStateSync (to newly connected session only)
+ * Crew login:       crew_register, crew_ping_ack
+ * Bug routing:      ReserveBug, RequestToPlaceWaypoint, RequestToClearWaypoint,
+ *                   RequestToClearTerminalWaypoint, CancelBugRoute
+ * Battery management: StartSimulation, ResetSimulation, QueryBugBatteries
  */
 @Component
 public class RawWebSocketHandler extends TextWebSocketHandler {
@@ -65,15 +59,11 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         }
     }
 
-    /** Server-side representation of an active bug route. */
     private static class RouteState {
         final String guid;
         final String crewId;
         final String bugN;
-        /** Bug's last known position — initially the spawn position sent with ReserveBug;
-         *  updated to the first waypoint's position each time it is cleared. */
         double cx, cy, cz;
-        /** Remaining (not-yet-reached) waypoints, in order. */
         final List<WaypointEntry> waypoints = new CopyOnWriteArrayList<>();
 
         RouteState(String guid, String crewId, String bugN, double cx, double cy, double cz) {
@@ -84,14 +74,10 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
 
     // ── Fields ────────────────────────────────────────────────────────────────
 
-    private final CopyOnWriteArraySet<WebSocketSession> sessions      = new CopyOnWriteArraySet<>();
-    private final ConcurrentHashMap<WebSocketSession, CrewSessionInfo> crewSessions        = new ConcurrentHashMap<>();
-    /** bugN → current route state (only for bugs that are actively routed). */
-    private final ConcurrentHashMap<String, RouteState> activeRoutes  = new ConcurrentHashMap<>();
-    /** bugN → last known world position [x, y, z] — persists after a route completes or is cancelled.
-     *  Used to sync bug positions to late-joining clients for routes that are no longer active. */
+    private final CopyOnWriteArraySet<WebSocketSession> sessions = new CopyOnWriteArraySet<>();
+    private final ConcurrentHashMap<WebSocketSession, CrewSessionInfo> crewSessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, RouteState> activeRoutes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, double[]> bugLastPositions = new ConcurrentHashMap<>();
-    /** session → set of reserved bugN values; max 2 per session. */
     private final ConcurrentHashMap<WebSocketSession, CopyOnWriteArraySet<String>> sessionBugReservations = new ConcurrentHashMap<>();
 
     private static final int MAX_BUGS_PER_SESSION = 2;
@@ -99,14 +85,17 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
     private final ClickedRepository    clickedRepository;
     private final CrewLoginRepository  crewLoginRepository;
     private final BugInRouteRepository bugInRouteRepository;
+    private final BatteryService       batteryService;
     private final ObjectMapper         objectMapper = new ObjectMapper();
 
     public RawWebSocketHandler(ClickedRepository clickedRepository,
                                 CrewLoginRepository crewLoginRepository,
-                                BugInRouteRepository bugInRouteRepository) {
+                                BugInRouteRepository bugInRouteRepository,
+                                BatteryService batteryService) {
         this.clickedRepository    = clickedRepository;
         this.crewLoginRepository  = crewLoginRepository;
         this.bugInRouteRepository = bugInRouteRepository;
+        this.batteryService       = batteryService;
     }
 
     // ── Connection lifecycle ──────────────────────────────────────────────────
@@ -116,20 +105,25 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         sessions.add(session);
         send(session, "{\"type\":\"connected\",\"message\":\"Welcome\"}");
         sendCrewStatus(session);
-        // Send current route state for every actively routed bug so late-joiners
-        // can reconstruct the routing visuals and bug positions.
+
+        // Send active route states so late-joiners reconstruct routing visuals.
         for (RouteState rs : activeRoutes.values()) {
             sendRouteSyncToSession(session, rs);
         }
-        // Send final positions for bugs whose routes have already completed or were cancelled,
-        // so late-joiners see them at the correct resting location rather than their spawn point.
+
+        // Send resting positions for completed/cancelled routes.
         for (Map.Entry<String, double[]> e : bugLastPositions.entrySet()) {
-            if (!activeRoutes.containsKey(e.getKey())) { // skip if an active RouteStateSync was already sent
+            if (!activeRoutes.containsKey(e.getKey())) {
                 double[] p = e.getValue();
                 send(session, String.format(
                     "{\"type\":\"BugPositionSync\",\"bugN\":\"%s\",\"x\":%s,\"y\":%s,\"z\":%s}",
                     esc(e.getKey()), p[0], p[1], p[2]));
             }
+        }
+
+        // Send current battery state if simulation is running.
+        if (batteryService.isSimulationStarted()) {
+            sendSimulationStateSync(session);
         }
     }
 
@@ -165,6 +159,9 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
                 case "RequestToClearWaypoint"         -> handleRequestToClearWaypoint(json);
                 case "RequestToClearTerminalWaypoint" -> handleRequestToClearTerminalWaypoint(session, json);
                 case "CancelBugRoute"                 -> handleCancelBugRoute(session, json);
+                case "StartSimulation"                -> handleStartSimulation();
+                case "ResetSimulation"                -> handleResetSimulation();
+                case "QueryBugBatteries"              -> handleQueryBugBatteries(session, json);
             }
         } catch (Exception e) {
             // invalid JSON — ignore
@@ -246,7 +243,6 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
-        // Enforce the per-session routing limit.
         CopyOnWriteArraySet<String> myReservations = sessionBugReservations.getOrDefault(session, new CopyOnWriteArraySet<>());
         if (myReservations.size() >= MAX_BUGS_PER_SESSION) {
             send(session, "{\"type\":\"RoutingLimitExceeded\"}");
@@ -274,7 +270,6 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         RouteState rs = activeRoutes.get(bugN);
         if (rs != null) rs.waypoints.add(new WaypointEntry(x, y, z, terminal));
 
-        // Use sfmt-safe approach: numbers are not strings and don't need escaping.
         String msg = String.format(
             "{\"type\":\"ResponseToPlaceWaypoint\",\"guid\":\"%s\",\"crewId\":\"%s\"," +
             "\"bugN\":\"%s\",\"x\":%s,\"y\":%s,\"z\":%s,\"terminal\":%b}",
@@ -290,7 +285,6 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         RouteState rs = activeRoutes.get(bugN);
         if (rs != null && !rs.waypoints.isEmpty()) {
             WaypointEntry cleared = rs.waypoints.remove(0);
-            // Update the bug's last known position to where it just arrived.
             rs.cx = cleared.x;
             rs.cy = cleared.y;
             rs.cz = cleared.z;
@@ -314,7 +308,6 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         });
         removeSessionReservation(session, bugN);
 
-        // Broadcast with the bug's last known position so every client can sync.
         broadcast(String.format(
             "{\"type\":\"BugReservationReleased\",\"bugN\":\"%s\",\"x\":%s,\"y\":%s,\"z\":%s}",
             esc(bugN), x, y, z));
@@ -325,16 +318,16 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         String bugN = str(json, "bugN");
         if (bugN == null) return;
 
-        // Capture terminal position before removing from activeRoutes so late-joiners can sync.
         RouteState rs = activeRoutes.remove(bugN);
+        double termX = 0, termY = 0, termZ = 0;
         if (rs != null) {
-            // The terminal waypoint is the last remaining entry in rs.waypoints.
             if (!rs.waypoints.isEmpty()) {
                 WaypointEntry terminal = rs.waypoints.get(0);
-                bugLastPositions.put(bugN, new double[]{ terminal.x, terminal.y, terminal.z });
+                termX = terminal.x; termY = terminal.y; termZ = terminal.z;
             } else {
-                bugLastPositions.put(bugN, new double[]{ rs.cx, rs.cy, rs.cz });
+                termX = rs.cx; termY = rs.cy; termZ = rs.cz;
             }
+            bugLastPositions.put(bugN, new double[]{ termX, termY, termZ });
         }
 
         bugInRouteRepository.findActiveByBugN(bugN).ifPresent(r -> {
@@ -343,8 +336,172 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         });
         removeSessionReservation(session, bugN);
 
+        // Server auto-detects docking and performs battery transfer
+        if (batteryService.isSimulationStarted()) {
+            String nearestRack = batteryService.findNearestRack(termX, termZ);
+            if (nearestRack != null) {
+                Instant now = Instant.now();
+                BatteryService.TransferResult result = batteryService.performTransfer(bugN, nearestRack, now);
+
+                // Notify all clients of updated bug inventory
+                BatteryService.BugInventory inv = result.bugInventory();
+                broadcast(String.format(
+                    "{\"type\":\"BugInventoryUpdate\",\"bugN\":\"%s\",\"charged\":%d,\"drained\":%d}",
+                    esc(bugN), inv.charged(), inv.drained()));
+
+                // Notify all clients of updated battery levels for affected racks
+                for (String rackId : result.affectedRackIds()) {
+                    String facilityId = BatteryService.FACILITY_RACKS.entrySet().stream()
+                        .filter(e -> java.util.Arrays.asList(e.getValue()).contains(rackId))
+                        .map(Map.Entry::getKey)
+                        .findFirst().orElse(null);
+                    if (facilityId != null) {
+                        broadcastLocationBatteryUpdate(facilityId, now);
+                    }
+                }
+            }
+        }
+
         broadcast(sfmt("{\"type\":\"ResponseToClearTerminalWaypoint\",\"bugN\":\"%s\",\"guid\":\"%s\"}",
             bugN, guid != null ? guid : ""));
+    }
+
+    // ── Battery management ────────────────────────────────────────────────────
+
+    private void handleStartSimulation() {
+        if (!batteryService.isSimulationStarted()) {
+            batteryService.initializeSimulation(Instant.now());
+            broadcastSimulationStateSync();
+        }
+    }
+
+    private void handleResetSimulation() {
+        batteryService.resetSimulation();
+        broadcastSimulationStateSync();
+        broadcast("{\"type\":\"SimulationReset\"}");
+    }
+
+    private void handleQueryBugBatteries(WebSocketSession session, Map<String, Object> json) {
+        String bugN = str(json, "bugN");
+        if (bugN == null || !batteryService.isSimulationStarted()) return;
+        Instant now = Instant.now();
+        BatteryService.BugInventory inv = batteryService.getBugInventory(bugN, now);
+        send(session, String.format(
+            "{\"type\":\"BugBatteryStatus\",\"bugN\":\"%s\",\"charged\":%d,\"drained\":%d}",
+            esc(bugN), inv.charged(), inv.drained()));
+    }
+
+    /**
+     * 1-second tick: compute current battery charges, broadcast updates, detect failures.
+     * Only runs if simulation has been started.
+     */
+    @Scheduled(fixedDelay = 1_000)
+    public void tickBatteries() {
+        if (!batteryService.isSimulationStarted() || sessions.isEmpty()) return;
+        Instant now = Instant.now();
+
+        // Broadcast updated charges for all drainable facilities and charging station
+        for (String facilityId : BatteryService.FACILITY_RACKS.keySet()) {
+            broadcastLocationBatteryUpdate(facilityId, now);
+        }
+
+        // Detect newly failed facilities
+        List<String> newlyFailed = batteryService.detectNewFailures(now);
+        for (String facilityId : newlyFailed) {
+            broadcast(String.format("{\"type\":\"LocationFailed\",\"facilityId\":\"%s\"}", esc(facilityId)));
+        }
+
+        // Check for game over
+        if (batteryService.checkGameOver()) {
+            broadcast("{\"type\":\"GameOver\"}");
+        }
+    }
+
+    /** Builds and broadcasts a LocationBatteryUpdate for a facility. */
+    private void broadcastLocationBatteryUpdate(String facilityId, Instant now) {
+        try {
+            List<BatteryService.RackInfo> racks = batteryService.getFacilityState(facilityId, now);
+            Map<String, Object> msg = new LinkedHashMap<>();
+            msg.put("type", "LocationBatteryUpdate");
+            msg.put("facilityId", facilityId);
+            List<Map<String, Object>> rackList = new ArrayList<>();
+            for (BatteryService.RackInfo rack : racks) {
+                Map<String, Object> rackMap = new LinkedHashMap<>();
+                rackMap.put("rackId", rack.rackId());
+                List<Map<String, Object>> slotList = new ArrayList<>();
+                for (BatteryService.SlotInfo slot : rack.slots()) {
+                    Map<String, Object> slotMap = new LinkedHashMap<>();
+                    slotMap.put("slot", slot.slot());
+                    slotMap.put("charge", slot.charge());
+                    slotList.add(slotMap);
+                }
+                rackMap.put("batteries", slotList);
+                rackList.add(rackMap);
+            }
+            msg.put("racks", rackList);
+            broadcast(objectMapper.writeValueAsString(msg));
+        } catch (Exception e) {
+            // serialization failure — skip
+        }
+    }
+
+    /**
+     * Sends a SimulationStateSync to a single newly-connected session.
+     * Includes all current battery states and failure info.
+     */
+    private void sendSimulationStateSync(WebSocketSession session) {
+        try {
+            Instant now = Instant.now();
+            Map<String, Object> msg = buildSimulationStateSyncMsg(now);
+            send(session, objectMapper.writeValueAsString(msg));
+        } catch (Exception e) {
+            // serialization failure — skip
+        }
+    }
+
+    /** Broadcasts SimulationStateSync to ALL sessions (called after start/reset). */
+    private void broadcastSimulationStateSync() {
+        try {
+            Instant now = Instant.now();
+            String json = objectMapper.writeValueAsString(buildSimulationStateSyncMsg(now));
+            broadcast(json);
+        } catch (Exception e) {
+            // serialization failure — skip
+        }
+    }
+
+    private Map<String, Object> buildSimulationStateSyncMsg(Instant now) {
+        Map<String, Object> msg = new LinkedHashMap<>();
+        msg.put("type", "SimulationStateSync");
+
+        // All facility rack states
+        Map<String, List<BatteryService.RackInfo>> allState = batteryService.getAllFacilitiesState(now);
+        List<Map<String, Object>> facilityList = new ArrayList<>();
+        for (Map.Entry<String, List<BatteryService.RackInfo>> entry : allState.entrySet()) {
+            Map<String, Object> fMap = new LinkedHashMap<>();
+            fMap.put("facilityId", entry.getKey());
+            List<Map<String, Object>> rackList = new ArrayList<>();
+            for (BatteryService.RackInfo rack : entry.getValue()) {
+                Map<String, Object> rackMap = new LinkedHashMap<>();
+                rackMap.put("rackId", rack.rackId());
+                List<Map<String, Object>> slotList = new ArrayList<>();
+                for (BatteryService.SlotInfo slot : rack.slots()) {
+                    Map<String, Object> slotMap = new LinkedHashMap<>();
+                    slotMap.put("slot", slot.slot());
+                    slotMap.put("charge", slot.charge());
+                    slotList.add(slotMap);
+                }
+                rackMap.put("batteries", slotList);
+                rackList.add(rackMap);
+            }
+            fMap.put("racks", rackList);
+            facilityList.add(fMap);
+        }
+        msg.put("facilities", facilityList);
+        msg.put("failedFacilities", new ArrayList<>(batteryService.getFailedFacilities()));
+        msg.put("gameOver", batteryService.isGameOver());
+
+        return msg;
     }
 
     // ── Cleanup helpers ───────────────────────────────────────────────────────
@@ -357,19 +514,16 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         }
     }
 
-    /** Release a single bug reservation from a session's set. */
     private void removeSessionReservation(WebSocketSession session, String bugN) {
         CopyOnWriteArraySet<String> reserved = sessionBugReservations.get(session);
         if (reserved != null) reserved.remove(bugN);
     }
 
-    /** Release ALL bug reservations held by a session (called on disconnect). */
     private void releaseBugReservation(WebSocketSession session) {
         CopyOnWriteArraySet<String> reserved = sessionBugReservations.remove(session);
         if (reserved == null || reserved.isEmpty()) return;
         for (String bugN : reserved) {
             RouteState rs = activeRoutes.remove(bugN);
-            // Persist best-known position so late-joiners can still see where the bug was.
             if (rs != null) {
                 if (!rs.waypoints.isEmpty()) {
                     WaypointEntry last = rs.waypoints.get(0);
@@ -397,7 +551,6 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
 
     // ── Route state sync ──────────────────────────────────────────────────────
 
-    /** Send a complete route-state snapshot to a single (newly connected) session. */
     private void sendRouteSyncToSession(WebSocketSession session, RouteState rs) {
         try {
             Map<String, Object> msg = new LinkedHashMap<>();
@@ -452,12 +605,10 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         for (WebSocketSession s : sessions) send(s, text);
     }
 
-    /** Extract a field as a String, or null if missing. */
     private static String str(Map<String, Object> json, String key) {
         Object v = json.get(key); return v != null ? v.toString() : null;
     }
 
-    /** Extract a numeric field as double (0.0 if missing). */
     private static double dbl(Map<String, Object> json, String key) {
         Object v = json.get(key);
         if (v == null) return 0.0;
@@ -465,7 +616,6 @@ public class RawWebSocketHandler extends TextWebSocketHandler {
         try { return Double.parseDouble(v.toString()); } catch (NumberFormatException e) { return 0.0; }
     }
 
-    /** Simple format that escapes every %s argument for JSON string safety. */
     private static String sfmt(String template, String... args) {
         Object[] escaped = new Object[args.length];
         for (int i = 0; i < args.length; i++) escaped[i] = esc(args[i]);

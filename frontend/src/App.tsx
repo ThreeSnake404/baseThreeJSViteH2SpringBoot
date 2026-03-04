@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import { useRef, useEffect, useState, useCallback } from 'react';
 import {
   Scene,
   type SelectedObjectInfo,
@@ -8,10 +8,7 @@ import {
   type RoutingApi,
 } from './three/Scene';
 import { BatteryRack } from './BatteryRack';
-import {
-  PAD_CONFIG,
-  getDrainableFacilityBatteries,
-} from './padConfig';
+import { PAD_CONFIG } from './padConfig';
 
 const API_BASE = '';
 
@@ -128,7 +125,8 @@ function App() {
   const myRoutingBugsRef = useRef<Set<string>>(new Set());
   const [hoverInfo, setHoverInfo] = useState<HoverInfo>(null);
   const [simulationRunning, setSimulationRunning] = useState(false);
-  const simulationStartTimeRef = useRef<number>(0);
+  /** Latest bug battery status from server (shown in hover tooltip). */
+  const [bugBatteryDisplay, setBugBatteryDisplay] = useState<{ bugN: string; charged: number; drained: number } | null>(null);
   /** Which crew member THIS page has successfully registered as (null = none). */
   const [myCrewId, setMyCrewId] = useState<CrewId | null>(null);
   /** Ref kept in sync with myCrewId so async ping-timeout callbacks read fresh value. */
@@ -254,8 +252,11 @@ function App() {
             setActiveCrewIds((prev) => new Set([...prev, cid]));
             resetPingTimer(cid);
             enqueueMessage(`\n\n${CREW_LABELS[cid] ?? cid} logged in. Simulation will begin shortly.`);
-            // Auto-start simulation on first crew login
-            setSimulationRunning((r) => { if (!r) simulationStartTimeRef.current = Date.now(); return true; });
+            // Auto-start simulation on first crew login; also tell server to initialize batteries
+            setSimulationRunning((r) => {
+              if (!r) wsRef.current?.send(JSON.stringify({ type: 'StartSimulation' }));
+              return true;
+            });
           } else if (msg.status === 'already_taken') {
             enqueueMessage('\n\nWARNING: Someone is already logged in as that user. Try a different astronaut.');
           }
@@ -341,6 +342,52 @@ function App() {
             syncGuid,
             waypoints,
           );
+
+        // ── Battery management ───────────────────────────────────────────────
+        } else if (type === 'LocationBatteryUpdate') {
+          const facilityId = msg.facilityId as string;
+          const racks = msg.racks as Array<{ rackId: string; batteries: Array<{ slot: number; charge: number }> }>;
+          batteryApiRef.current?.updateLocationBatteries(facilityId, racks);
+
+        } else if (type === 'LocationFailed') {
+          const facilityId = msg.facilityId as string;
+          batteryApiRef.current?.setFacilityFailed(facilityId, true);
+          const displayName = FACILITY_DISPLAY_NAMES[facilityId] ?? facilityId;
+          enqueueMessage(`\n\nDANGER: You have just lost ${displayName} because of zero batteries available. This facility cannot be restored until the simulation is restarted.`);
+
+        } else if (type === 'GameOver') {
+          enqueueMessage('\n\nDANGER: You have lost food, air, and water facilities. This ends the simulation. Press Restart to begin again.');
+
+        } else if (type === 'BugInventoryUpdate') {
+          batteryApiRef.current?.updateBugInventory(
+            msg.bugN as string,
+            Number(msg.charged),
+            Number(msg.drained),
+          );
+
+        } else if (type === 'BugBatteryStatus') {
+          setBugBatteryDisplay({
+            bugN: msg.bugN as string,
+            charged: Number(msg.charged),
+            drained: Number(msg.drained),
+          });
+
+        } else if (type === 'SimulationStateSync') {
+          // Full battery state snapshot for newly connected or reset clients.
+          const facilities = msg.facilities as Array<{
+            facilityId: string;
+            racks: Array<{ rackId: string; batteries: Array<{ slot: number; charge: number }> }>;
+          }>;
+          for (const f of (facilities ?? [])) {
+            batteryApiRef.current?.updateLocationBatteries(f.facilityId, f.racks);
+          }
+          for (const fid of ((msg.failedFacilities as string[]) ?? [])) {
+            batteryApiRef.current?.setFacilityFailed(fid, true);
+          }
+
+        } else if (type === 'SimulationReset') {
+          // Server confirmed reset — clear visual state (battery charges come via SimulationStateSync)
+          batteryApiRef.current?.resetSimulation();
         }
       } catch {
         // not JSON — ignore
@@ -394,6 +441,11 @@ function App() {
 
   const onHoverInfoChange = useCallback((info: HoverInfo) => {
     setHoverInfo(info);
+    // Query server for bug battery inventory when hovering over a bug
+    if (info?.label && /^bug\d+$/i.test(info.label.split('\n')[0].trim())) {
+      const bugN = info.label.split('\n')[0].trim();
+      wsRef.current?.send(JSON.stringify({ type: 'QueryBugBatteries', bugN }));
+    }
   }, []);
 
   const applyZoom = (multiplier: number) => {
@@ -605,92 +657,7 @@ function App() {
     setCameraRef.current?.(params);
   };
 
-  const drainableFacilities = useMemo(() => getDrainableFacilityBatteries(), []);
-  const BATTERY_DRAIN_SEC = 30;
-  const DRAINED_THRESHOLD = 1;
-
-  const failedFacilitiesRef = useRef<Set<string>>(new Set());
-  const gameOverShownRef = useRef(false);
-  const userBatteryFillTimesRef = useRef<Map<string, number>>(new Map());
-  const simulationRafRef = useRef<number>(0);
-  useEffect(() => {
-    if (!simulationRunning || !batteryApiRef.current) return;
-    simulationStartTimeRef.current = Date.now();
-    const tick = () => {
-      if (!batteryApiRef.current) return;
-      const now = Date.now();
-      const elapsed = (now - simulationStartTimeRef.current) / 1000;
-      const api = batteryApiRef.current;
-
-      for (const { facilityId, batteryIds } of drainableFacilities) {
-        // Once failed, stays failed until Restart
-        if (failedFacilitiesRef.current.has(facilityId)) {
-          api.setFacilityFailed(facilityId, true);
-          continue;
-        }
-
-        const currentIndex = Math.floor(elapsed / BATTERY_DRAIN_SEC);
-        const chargeCurrent =
-          currentIndex < batteryIds.length
-            ? Math.max(0, 100 * (1 - (elapsed % BATTERY_DRAIN_SEC) / BATTERY_DRAIN_SEC))
-            : 0;
-
-        for (let i = 0; i < batteryIds.length; i++) {
-          const id = batteryIds[i];
-          const current = api.getBatteryCharge(id);
-          if (current !== undefined && current < 0) {
-            // Battery is an empty slot — remove stale fill-time tracking
-            userBatteryFillTimesRef.current.delete(id);
-            continue;
-          }
-          if (api.isBatteryUserFilled(id)) {
-            // User-transferred battery: drain independently based on when it was placed
-            if (!userBatteryFillTimesRef.current.has(id)) {
-              userBatteryFillTimesRef.current.set(id, now);
-            }
-            const age = (now - userBatteryFillTimesRef.current.get(id)!) / 1000;
-            const c = Math.max(0, 100 * (1 - age / BATTERY_DRAIN_SEC));
-            api.setBatteryCharge(id, c);
-            continue;
-          }
-          const c = i < currentIndex ? 0 : i === currentIndex ? chargeCurrent : 100;
-          api.setBatteryCharge(id, c);
-        }
-
-        // Skip failure checks for the first 5 seconds — batteries are still initializing
-        if (elapsed < 5) continue;
-
-        // Only check failure once batteries have actually been created
-        const anyExists = batteryIds.some((id) => api.getBatteryCharge(id) !== undefined);
-        if (!anyExists) continue;
-
-        // Failure based on actual battery state, not time
-        const anyCharged = batteryIds.some((id) => {
-          const charge = api.getBatteryCharge(id);
-          if (charge === undefined || charge < 0) return false;
-          return charge > DRAINED_THRESHOLD;
-        });
-
-        if (!anyCharged) {
-          failedFacilitiesRef.current.add(facilityId);
-          api.setFacilityFailed(facilityId, true);
-          const displayName = FACILITY_DISPLAY_NAMES[facilityId] ?? facilityId;
-          enqueueMessage(`\n\nDANGER: You have just lost ${displayName} because of zero batteries available. This facility cannot be restored until the simulation is restarted.`);
-        }
-      }
-
-      // Check if all drainable facilities are now failed
-      if (!gameOverShownRef.current &&
-          drainableFacilities.every(({ facilityId }) => failedFacilitiesRef.current.has(facilityId))) {
-        gameOverShownRef.current = true;
-        enqueueMessage('\n\nDANGER: You have lost food, air, and water facilities. This ends the simulation. Press Restart to begin again.');
-      }
-
-      simulationRafRef.current = requestAnimationFrame(tick);
-    };
-    simulationRafRef.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(simulationRafRef.current);
-  }, [simulationRunning, drainableFacilities, enqueueMessage]);
+  // Server-side battery management: no client-side simulation loop needed.
 
   const inputStyle: React.CSSProperties = {
     width: 56,
@@ -810,8 +777,8 @@ function App() {
               type="button"
               onClick={() => {
                 if (activeCrewIds.size === 0) return;
-                simulationStartTimeRef.current = Date.now();
                 setSimulationRunning(true);
+                wsRef.current?.send(JSON.stringify({ type: 'StartSimulation' }));
               }}
               disabled={simulationRunning || activeCrewIds.size === 0}
               title={activeCrewIds.size === 0 ? 'At least one astronaut must be logged in to start the simulation' : undefined}
@@ -1099,6 +1066,17 @@ function App() {
           }}
         >
           {hoverInfo.label}
+          {(() => {
+            const label = hoverInfo.label.split('\n')[0].trim();
+            if (/^bug\d+$/i.test(label) && bugBatteryDisplay?.bugN === label) {
+              return (
+                <div style={{ marginTop: 4, fontSize: 10, color: '#aaa' }}>
+                  {`Charged: ${bugBatteryDisplay.charged}  Drained: ${bugBatteryDisplay.drained}`}
+                </div>
+              );
+            }
+            return null;
+          })()}
         </div>
       )}
       </div>
@@ -1175,12 +1153,7 @@ function App() {
               <button
                 type="button"
                 onClick={() => {
-                  if (!batteryApiRef.current) return;
-                  batteryApiRef.current.resetSimulation();
-                  failedFacilitiesRef.current.clear();
-                  gameOverShownRef.current = false;
-                  userBatteryFillTimesRef.current.clear();
-                  simulationStartTimeRef.current = Date.now();
+                  wsRef.current?.send(JSON.stringify({ type: 'ResetSimulation' }));
                   typewriterQueueRef.current = '\nSimulation restarted. All systems nominal.';
                   setMessageText('');
                 }}

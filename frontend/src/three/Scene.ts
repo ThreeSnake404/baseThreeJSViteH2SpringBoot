@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { createRenderer } from './core/Renderer';
 import { setupResize } from './core/ResizeHandler';
-import { FACILITY_CENTERS, FACILITY_PADS, FAILURE_SPHERE_UNIFORM_RADIUS, PAD_CONFIG } from '../padConfig';
+import { FACILITY_CENTERS, FAILURE_SPHERE_UNIFORM_RADIUS } from '../padConfig';
 
 /** Radians per second when steering left/right on the XZ plane. */
 const STEER_SPEED = 1.2;
@@ -42,12 +42,6 @@ const GROUND_PLANE_Y = 0.1;
 const BUG_FORWARD_Y_OFFSET = -Math.PI / 2;
 /** Charge value for empty slot (drawn black). */
 const BATTERY_EMPTY = -1;
-/** Seconds to fully charge a drained battery at a rack. */
-const BATTERY_CHARGE_TIME = 10;
-/** Max batteries a bug can carry. */
-const BUG_MAX_BATTERIES = 9;
-/** Distance from bug to pad center to trigger dock dialog. */
-const DOCK_THRESHOLD = 1.5;
 /** Duration in seconds for facility failure sphere expansion (red then dull gray). */
 const FAILURE_SPHERE_DURATION = 2;
 
@@ -108,8 +102,6 @@ export type BatteryApi = {
   setBatteryCharge: (id: string, charge: number) => void;
   /** Current charge (0–100) or negative for empty. Undefined if battery not found. */
   getBatteryCharge: (id: string) => number | undefined;
-  /** True if this slot was filled with a full battery from the bug (simulation should not overwrite). */
-  isBatteryUserFilled: (id: string) => boolean;
   removeBattery: (id: string) => void;
   createBatteryRack: (
     rackId: string,
@@ -119,35 +111,17 @@ export type BatteryApi = {
   ) => void;
   removeBatteryRack: (rackId: string) => void;
   setFacilityFailed: (facilityId: string, failed: boolean) => void;
-  /** Reset simulation: refill all batteries, clear overlays, return bugs to start. */
+  /** Reset visual state: clear overlays, return bugs to start. Server sends SimulationStateSync to update charges. */
   resetSimulation: () => void;
   /** Re-apply battery colors (fixes black draw after zoom/camera change). */
   refreshBatteryMaterials: () => void;
-  /** Get rack state for dock dialog. */
-  getRackState: (rackId: string) => { charged: number; drained: number; empty: number };
-  /** Get bug inventory (charged, drained; max 9 total). */
-  getBugInventory: (bugId: string) => { charged: number; drained: number };
-  /** Apply dock transfer after user answers dialog. */
-  dockAtPad: (
-    rackId: string,
-    bugId: string,
-    loadCharged: number,
-    acceptDrained: number,
-    loadYes: boolean,
-    acceptYes: boolean
+  /** Update all battery charges for a facility from server push. charge=-1 means empty slot. */
+  updateLocationBatteries: (
+    facilityId: string,
+    racks: Array<{ rackId: string; batteries: Array<{ slot: number; charge: number }> }>
   ) => void;
-};
-
-export type DockAtPadParams = {
-  rackId: string;
-  bugId: string;
-  loadCharged: number;
-  acceptDrained: number;
-  /** First question (e.g. "Transfer n drained batteries from the rack to the bug?"). */
-  question1: string;
-  /** Second question (e.g. "Transfer m full batteries from the bug to the rack?"). */
-  question2: string;
-  reason?: string;
+  /** Store the latest known bug battery inventory (from server BugInventoryUpdate). */
+  updateBugInventory: (bugN: string, charged: number, drained: number) => void;
 };
 
 /** API exposed by Scene.ts for server-coordinated bug routing. */
@@ -190,10 +164,7 @@ export type PlacementFacilityOptions = {
   onCameraChange?: (info: CameraInfo) => void;
   onHoverInfoChange?: (info: HoverInfo) => void;
   onRoutingChange?: (isRouting: boolean) => void;
-  onDockAtPad?: (params: DockAtPadParams, onAnswer: (loadYes: boolean, acceptYes: boolean) => void) => void;
   onRimWallBlock?: () => void;
-  /** Called when the user clicks a bug — tells App.tsx to send ReserveBug to server.
-   *  x/y/z are the bug's current world position so the server can track it for late-joiners. */
   onBugReserveRequest?: (bugN: string, x: number, y: number, z: number) => void;
   /** Called when the routing owner places a waypoint — tells App.tsx to send RequestToPlaceWaypoint. */
   onWaypointPlaceRequest?: (bugN: string, x: number, y: number, z: number, terminal: boolean) => void;
@@ -279,15 +250,9 @@ export class Scene {
   private readonly groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -GROUND_PLANE_Y);
   private mousePosition3D: THREE.Vector3 | null = null;
   private readonly waypointLinePoints: THREE.Vector3[] = [];
-  private lastFrameNearPadsByBug = new Map<string, Set<string>>();
-  private readonly tempVec3b = new THREE.Vector3();
+  /** Bug battery inventory cache — updated via updateBugInventory from server BugInventoryUpdate messages. */
   private readonly bugInventory = new Map<string, { charged: number; drained: number }>();
-  private readonly bugStartPads = new Map<string, { padName: string; rotation: number }>();
-  private readonly batteriesAllowedToCharge = new Set<string>();
-  /** Battery IDs that are empty (transferred out). Never blink these; always draw black. */
-  private readonly emptyBatteryIds = new Set<string>();
-  /** Battery IDs filled with a full from the bug at a facility; simulation must not overwrite. */
-  private readonly userFilledBatteryIds = new Set<string>();
+  private readonly bugStartPads = new Map<string, { padName: string; rotation: number }>(); 
   private colorIndex = 0;
   private readonly raycaster = new THREE.Raycaster();
   private readonly segRaycaster = new THREE.Raycaster();
@@ -674,14 +639,6 @@ export class Scene {
   private readonly blinkLerpColor = new THREE.Color();
 
   private updateBatteryBlink(elapsed: number): void {
-    this.emptyBatteryIds.forEach((id) => {
-      const bat = this.batteries.get(id);
-      if (!bat) return;
-      bat.planes.forEach((mesh) => {
-        const mat = mesh.material as THREE.MeshBasicMaterial;
-        mat.color.setHex(0x000000);
-      });
-    });
     const t = (elapsed % BATTERY_BLINK_CYCLE) / BATTERY_BLINK_CYCLE;
     const smooth = 0.5 - 0.5 * Math.cos(t * Math.PI * 2);
     this.blinkLerpColor.lerpColors(
@@ -690,10 +647,9 @@ export class Scene {
       smooth
     );
     const blinkHex = this.blinkLerpColor.getHex();
-    this.batteries.forEach((bat, id) => {
-      if (this.emptyBatteryIds.has(id)) return;
-      if (bat.charge < 0) return;
-      if (bat.charge !== 0) return;
+    this.batteries.forEach((bat) => {
+      if (bat.charge < 0) return;   // empty slot — already drawn black by updateBatteryColors
+      if (bat.charge !== 0) return; // not fully drained — no blink
       bat.planes.forEach((mesh) => {
         const mat = mesh.material as THREE.MeshBasicMaterial;
         mat.color.setHex(blinkHex);
@@ -702,20 +658,8 @@ export class Scene {
   }
 
   private resetSimulation(): void {
-    // Clear all route/waypoint state
+    // Clear all route/waypoint state and return bugs to start
     this.clearWaypointState();
-
-    // Clear battery transfer sets
-    this.emptyBatteryIds.clear();
-    this.userFilledBatteryIds.clear();
-    this.batteriesAllowedToCharge.clear();
-
-    // Refill all batteries to 100
-    for (const [id] of this.batteries) {
-      this.updateBatteryColors(id, 100);
-    }
-
-    // Clear bug inventories
     this.bugInventory.clear();
 
     // Clear all facility failure overlays
@@ -730,6 +674,7 @@ export class Scene {
       bug.rotation.y = rotation;
       this.positionBuggyOnPad(padName, bug);
     }
+    // Battery charges are reset by server — SimulationStateSync arrives after reset
   }
 
   private refreshBatteryMaterials(): void {
@@ -1139,8 +1084,12 @@ export class Scene {
             if (label) break;
             for (const [bugId, group] of this.buggies) {
               if (group === obj) {
-                const inv = this.getBugInventory(bugId);
-                label = `${bugId}\n[${inv.drained}] drained batteries\n[${inv.charged}] full batteries`;
+                const inv = this.bugInventory.get(bugId);
+                if (inv) {
+                  label = `${bugId}\n[${inv.drained}] drained batteries\n[${inv.charged}] full batteries`;
+                } else {
+                  label = bugId;
+                }
                 break;
               }
             }
@@ -1525,7 +1474,6 @@ export class Scene {
       this.scene.remove(state.waypointMarkersGroup);
     }
     this.bugRouteStates.delete(bugId);
-    this.lastFrameNearPadsByBug.delete(bugId);
     if (state.routeLine) {
       this.scene.remove(state.routeLine);
       state.routeLine.geometry.dispose();
@@ -1721,194 +1669,36 @@ export class Scene {
     return box.getCenter(new THREE.Vector3());
   }
 
-  /** Treat as drained when charge is 0 or very low (simulation can leave fractional values). */
-  private static readonly DRAINED_THRESHOLD = 1;
-
   private rackBatteryKey(rackId: string): string {
     return rackId.startsWith('battery-rack-') ? rackId : `battery-rack-${rackId}`;
   }
 
-  private getRackState(rackId: string): { charged: number; drained: number; empty: number } {
-    let charged = 0,
-      drained = 0,
-      empty = 0;
-    const key = this.rackBatteryKey(rackId);
-    for (let i = 1; i <= 4; i++) {
-      const bat = this.batteries.get(`${key}-battery-${i}`);
-      if (!bat) continue;
-      if (bat.charge < 0) empty++;
-      else if (bat.charge >= 100) charged++;
-      else if (bat.charge < Scene.DRAINED_THRESHOLD) drained++;
-    }
-    return { charged, drained, empty };
-  }
-
-  private getFacilityState(facilityId: string): { charged: number; drained: number; empty: number } {
-    let charged = 0,
-      drained = 0,
-      empty = 0;
-    const rackIds = FACILITY_PADS[facilityId];
-    if (!rackIds) return { charged, drained, empty };
-    for (const rId of rackIds) {
-      const s = this.getRackState(rId);
-      charged += s.charged;
-      drained += s.drained;
-      empty += s.empty;
-    }
-    return { charged, drained, empty };
-  }
-
-  private getBugInventory(bugId: string): { charged: number; drained: number } {
-    if (!this.bugInventory.has(bugId)) this.bugInventory.set(bugId, { charged: 0, drained: 0 });
-    return this.bugInventory.get(bugId)!;
-  }
-
-  private dockAtPad(
-    rackId: string,
-    bugId: string,
-    loadCharged: number,
-    acceptDrained: number,
-    loadYes: boolean,
-    acceptYes: boolean
+  /**
+   * Called by App.tsx when a LocationBatteryUpdate or SimulationStateSync message arrives.
+   * Updates visual battery charge levels for all slots in a facility.
+   * charge=-1 means empty slot (no battery present).
+   */
+  private updateLocationBatteries(
+    _facilityId: string,
+    racks: Array<{ rackId: string; batteries: Array<{ slot: number; charge: number }> }>
   ): void {
-    const inv = this.getBugInventory(bugId);
-    const isChargingStation = rackId.startsWith('ChargingStation');
-    const key = this.rackBatteryKey(rackId);
-    if (isChargingStation) {
-      // CS: question2 = "Transfer n full from station to bug?" (acceptYes). Do first to free slots.
-      if (acceptYes && loadCharged > 0) {
-        let taken = 0;
-        for (let i = 1; i <= 4 && taken < loadCharged; i++) {
-          const id = `${key}-battery-${i}`;
-          const bat = this.batteries.get(id);
-          if (bat && bat.charge >= 100) {
-            this.setBatteryCharge(id, BATTERY_EMPTY);
-            taken++;
-            inv.charged++;
-          }
-        }
-      }
-      // CS: question1 = "Transfer m drained from bug to station?" (loadYes). Into empty slots.
-      if (loadYes && acceptDrained > 0) {
-        let placed = 0;
-        for (let i = 1; i <= 4 && placed < acceptDrained; i++) {
-          const id = `${key}-battery-${i}`;
-          const bat = this.batteries.get(id);
-          if (bat && bat.charge < 0) {
-            this.setBatteryCharge(id, 0);
-            this.batteriesAllowedToCharge.add(id);
-            placed++;
-            inv.drained--;
-          }
-        }
-      }
-    } else {
-      // Facility: question1 = "Transfer n drained from rack to bug?" (loadYes). Take from all racks in this facility.
-      if (loadYes && acceptDrained > 0) {
-        const facilityId = this.getFacilityForRack(rackId);
-        const rackIds = facilityId ? (FACILITY_PADS[facilityId] ?? [rackId]) : [rackId];
-        let taken = 0;
-        for (const rId of rackIds) {
-          if (taken >= acceptDrained) break;
-          const rKey = this.rackBatteryKey(rId);
-          for (let i = 1; i <= 4 && taken < acceptDrained; i++) {
-            const id = `${rKey}-battery-${i}`;
-            const bat = this.batteries.get(id);
-            if (bat && bat.charge >= 0 && bat.charge < Scene.DRAINED_THRESHOLD) {
-              bat.charge = BATTERY_EMPTY;
-              this.emptyBatteryIds.add(id);
-              this.updateBatteryColors(id, BATTERY_EMPTY);
-              taken++;
-              inv.drained++;
-            }
-          }
-        }
-      }
-      // Facility: question2 = "Transfer m full from bug to rack?" (acceptYes). Into empty slots.
-      if (acceptYes && loadCharged > 0) {
-        let placed = 0;
-        for (let i = 1; i <= 4 && placed < loadCharged; i++) {
-          const id = `${key}-battery-${i}`;
-          const bat = this.batteries.get(id);
-          if (bat && bat.charge < 0) {
-            this.emptyBatteryIds.delete(id);
-            this.userFilledBatteryIds.add(id);
-            this.setBatteryCharge(id, 100);
-            placed++;
-            inv.charged--;
-          }
-        }
+    for (const rack of racks) {
+      const key = this.rackBatteryKey(rack.rackId);
+      for (let slot = 1; slot <= 4; slot++) {
+        const batteryData = rack.batteries.find((b) => b.slot === slot);
+        const charge = batteryData !== undefined ? batteryData.charge : BATTERY_EMPTY;
+        const batteryId = `${key}-battery-${slot}`;
+        this.setBatteryCharge(batteryId, charge);
       }
     }
   }
 
-  private isBatteryUserFilled(id: string): boolean {
-    return this.userFilledBatteryIds.has(id);
-  }
-
-  private getFacilityForRack(rackId: string): string | undefined {
-    const base = rackId.startsWith('battery-rack-') ? rackId.slice('battery-rack-'.length) : rackId;
-    for (const [facilityId, rackIds] of Object.entries(FACILITY_PADS)) {
-      if (rackIds.includes(base) || rackIds.includes(rackId)) return facilityId;
-    }
-    return undefined;
-  }
-
-  private checkDockAtPad(): void {
-    this.bugRouteStates.forEach((routeState, bugId) => {
-      // Only transfer at a terminal waypoint (the final destination), not while passing through.
-      if (!routeState.waypointTerminalPlaced || routeState.waypoints.length !== 1) return;
-
-      const bug = this.buggies.get(bugId);
-      if (!bug) return;
-      bug.getWorldPosition(this.tempVec3);
-      const bx = this.tempVec3.x;
-      const bz = this.tempVec3.z;
-      const currentNear = new Set<string>();
-      for (const pad of PAD_CONFIG) {
-        const [px, , pz] = pad.position;
-        const dist = Math.sqrt((bx - px) ** 2 + (bz - pz) ** 2);
-        if (dist <= DOCK_THRESHOLD) currentNear.add(pad.id);
-      }
-      const lastNear = this.lastFrameNearPadsByBug.get(bugId) ?? new Set<string>();
-      for (const rackId of currentNear) {
-        if (lastNear.has(rackId)) continue;
-        const inv = this.getBugInventory(bugId);
-        const total = inv.charged + inv.drained;
-        const isCS = rackId.startsWith('ChargingStation');
-        const room = BUG_MAX_BATTERIES - total;
-        const facilityId = this.getFacilityForRack(rackId);
-        const state = isCS ? this.getRackState(rackId) : (facilityId ? this.getFacilityState(facilityId) : this.getRackState(rackId));
-        let loadCharged: number;
-        let acceptDrained: number;
-        if (isCS) {
-          const nFullToBug = Math.min(state.charged, room);
-          const mDrainedToStation = Math.min(inv.drained, state.empty + nFullToBug);
-          loadCharged = nFullToBug;
-          acceptDrained = mDrainedToStation;
-        } else {
-          const nDrainedToBug = Math.min(state.drained, room);
-          const mFullToRack = Math.min(inv.charged, state.empty + nDrainedToBug);
-          loadCharged = mFullToRack;
-          acceptDrained = nDrainedToBug;
-        }
-        // Auto-answer yes to both transfer questions.
-        this.dockAtPad(rackId, bugId, loadCharged, acceptDrained, true, true);
-        this.lastFrameNearPadsByBug.set(bugId, new Set(currentNear));
-        return;
-      }
-      this.lastFrameNearPadsByBug.set(bugId, currentNear);
-    });
-  }
-
-  private updateBatteryCharging(dt: number): void {
-    const rate = (100 / BATTERY_CHARGE_TIME) * dt;
-    this.batteries.forEach((bat, id) => {
-      if (bat.charge < 0 || bat.charge >= 100) return;
-      if (!this.batteriesAllowedToCharge.has(id)) return;
-      bat.charge = Math.min(100, bat.charge + rate);
-      this.updateBatteryColors(id, bat.charge);
-    });
+  /**
+   * Called by App.tsx when a BugInventoryUpdate message arrives.
+   * Stores the server-authoritative battery inventory for hover display.
+   */
+  private updateBugInventory(bugN: string, charged: number, drained: number): void {
+    this.bugInventory.set(bugN, { charged, drained });
   }
 
   /** Find pad by name or displayName in ShinyPath and set buggy position to its world position (y + 0.1). */
@@ -2269,16 +2059,14 @@ export class Scene {
         createBattery: this.createBattery.bind(this),
         setBatteryCharge: this.setBatteryCharge.bind(this),
         getBatteryCharge: this.getBatteryCharge.bind(this),
-        isBatteryUserFilled: this.isBatteryUserFilled.bind(this),
         removeBattery: this.removeBattery.bind(this),
         createBatteryRack: this.createBatteryRack.bind(this),
         removeBatteryRack: this.removeBatteryRack.bind(this),
         setFacilityFailed: this.setFacilityFailed.bind(this),
         resetSimulation: this.resetSimulation.bind(this),
         refreshBatteryMaterials: this.refreshBatteryMaterials.bind(this),
-        getRackState: this.getRackState.bind(this),
-        getBugInventory: this.getBugInventory.bind(this),
-        dockAtPad: this.dockAtPad.bind(this),
+        updateLocationBatteries: this.updateLocationBatteries.bind(this),
+        updateBugInventory: this.updateBugInventory.bind(this),
       };
     }
     if (this.pfOptions?.routingApiRef) {
@@ -2374,9 +2162,7 @@ export class Scene {
         }
         this.updateConnectingLine();
         this.updateBugAlongPath(dt);
-        this.checkDockAtPad();
       }
-      this.updateBatteryCharging(dt);
       const t = this.clock.getElapsedTime();
       this.cubeMesh.rotation.x = t * 0.2;
       this.cubeMesh.rotation.y = t * 0.3;
