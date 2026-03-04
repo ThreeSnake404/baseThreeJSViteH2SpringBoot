@@ -5,6 +5,7 @@ import {
   type CameraInfo,
   type CameraParams,
   type HoverInfo,
+  type RoutingApi,
 } from './three/Scene';
 import { BatteryRack } from './BatteryRack';
 import {
@@ -122,6 +123,9 @@ function App() {
   const setScaleRef = useRef<((sx: number, sy: number, sz: number) => void) | null>(null);
   const setCameraRef = useRef<((params: CameraParams) => void) | null>(null);
   const batteryApiRef = useRef<import('./three/Scene').BatteryApi | null>(null);
+  const routingApiRef = useRef<RoutingApi | null>(null);
+  /** Bugs reserved by THIS page's session (we send the clear messages for these). */
+  const myRoutingBugsRef = useRef<Set<string>>(new Set());
   const [hoverInfo, setHoverInfo] = useState<HoverInfo>(null);
   const [simulationRunning, setSimulationRunning] = useState(false);
   const simulationStartTimeRef = useRef<number>(0);
@@ -277,6 +281,59 @@ function App() {
             setMyCrewId(null);
             enqueueMessage(`\n\nWARNING: ${CREW_LABELS[cid] ?? cid} session timed out and has been logged out.`);
           }
+
+        // ── Bug routing ──────────────────────────────────────────────────────
+        } else if (type === 'RoutingRequestGranted') {
+          const bugN   = msg.bugN as string;
+          const guid   = msg.guid as string;
+          const crewId = msg.crewId as string;
+          if (guid === guidRef.current) myRoutingBugsRef.current.add(bugN);
+          routingApiRef.current?.receiveRoutingGranted(bugN, crewId, guid);
+
+        } else if (type === 'AlreadyReserved') {
+          const bugN = msg.bugN as string;
+          enqueueMessage(`\n\nWARNING: ${bugN} is already being routed.`);
+
+        } else if (type === 'RoutingLimitExceeded') {
+          enqueueMessage('\n\nWARNING: A single user can only route (2) bugs at once.');
+
+        } else if (type === 'ResponseToPlaceWaypoint') {
+          routingApiRef.current?.receiveWaypoint(
+            msg.bugN as string,
+            Number(msg.x), Number(msg.y), Number(msg.z),
+            msg.terminal === true || msg.terminal === 'true',
+            msg.crewId as string,
+          );
+
+        } else if (type === 'ResponseToClearWaypoint') {
+          routingApiRef.current?.receiveClearWaypoint(msg.bugN as string);
+
+        } else if (type === 'ResponseToClearTerminalWaypoint') {
+          const bugN = msg.bugN as string;
+          myRoutingBugsRef.current.delete(bugN);
+          routingApiRef.current?.receiveClearTerminalWaypoint(bugN);
+
+        } else if (type === 'BugReservationReleased') {
+          const bugN = msg.bugN as string;
+          myRoutingBugsRef.current.delete(bugN);
+          const rx = msg.x != null ? Number(msg.x) : undefined;
+          const rz = msg.z != null ? Number(msg.z) : undefined;
+          routingApiRef.current?.receiveBugReleased(bugN, rx, rz);
+
+        } else if (type === 'RouteStateSync') {
+          // Full route-state snapshot sent to this client when it first connects.
+          const waypoints = (msg.waypoints as Array<{ x: number; y: number; z: number; terminal: boolean }>) ?? [];
+          const syncGuid = msg.guid as string;
+          if (syncGuid === guidRef.current) myRoutingBugsRef.current.add(msg.bugN as string);
+          routingApiRef.current?.receiveRouteStateSync(
+            msg.bugN    as string,
+            Number(msg.currentX),
+            Number(msg.currentY),
+            Number(msg.currentZ),
+            msg.crewId  as string,
+            syncGuid,
+            waypoints,
+          );
         }
       } catch {
         // not JSON — ignore
@@ -406,6 +463,33 @@ function App() {
         onRimWallBlock: () => {
           enqueueMessage('\n\nWARNING: You cannot create a route across the Rim Wall unless it is through a tunnel.');
         },
+        onBugReserveRequest: (bugN, x, y, z) => {
+          const ws = wsRef.current;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(JSON.stringify({ type: 'ReserveBug', guid: guidRef.current, crewId: myCrewIdRef.current ?? 'observer', bugN, x, y, z }));
+        },
+        onWaypointPlaceRequest: (bugN, x, y, z, terminal) => {
+          const ws = wsRef.current;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(JSON.stringify({ type: 'RequestToPlaceWaypoint', guid: guidRef.current, crewId: myCrewIdRef.current ?? 'observer', bugN, x, y, z, terminal }));
+        },
+        onWaypointCleared: (bugN, terminal) => {
+          const ws = wsRef.current;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          if (terminal) {
+            ws.send(JSON.stringify({ type: 'RequestToClearTerminalWaypoint', guid: guidRef.current, bugN }));
+          } else {
+            ws.send(JSON.stringify({ type: 'RequestToClearWaypoint', guid: guidRef.current, bugN }));
+          }
+        },
+        onRouteCancelled: (bugN, x, y, z) => {
+          const ws = wsRef.current;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(JSON.stringify({ type: 'CancelBugRoute', guid: guidRef.current, bugN, x, y, z }));
+          myRoutingBugsRef.current.delete(bugN);
+        },
+        pageGuid: guidRef.current,
+        routingApiRef,
         setPositionRef,
         setRotationRef,
         setScaleRef,

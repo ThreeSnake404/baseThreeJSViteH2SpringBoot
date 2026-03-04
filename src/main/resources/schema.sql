@@ -1,3 +1,3 @@
--- Drop the old crew_login table so Hibernate can recreate it with the new schema
--- (old table used BIGINT auto-increment id; new schema uses VARCHAR(36) GUID as primary key).
+-- Drop tables that need schema changes so Hibernate recreates them correctly on startup.
 DROP TABLE IF EXISTS crew_login;
+DROP TABLE IF EXISTS bugs_in_route;

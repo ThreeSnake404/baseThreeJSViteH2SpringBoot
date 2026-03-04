@@ -150,6 +150,35 @@ export type DockAtPadParams = {
   reason?: string;
 };
 
+/** API exposed by Scene.ts for server-coordinated bug routing. */
+export type RoutingApi = {
+  /** Server granted a routing reservation — set up the routing circle and start listening for waypoints. */
+  receiveRoutingGranted: (bugN: string, crewId: string, guid: string) => void;
+  /** Server broadcast a waypoint — add it to the named bug's route. */
+  receiveWaypoint: (bugN: string, x: number, y: number, z: number, terminal: boolean, crewId: string) => void;
+  /** Server cleared the next (first) non-terminal waypoint — advance the bug. */
+  receiveClearWaypoint: (bugN: string) => void;
+  /** Server cleared the terminal waypoint — routing is complete, clean up everything. */
+  receiveClearTerminalWaypoint: (bugN: string) => void;
+  /** Server released the reservation without completing routing (e.g. ESC, RimWall, or owner disconnect).
+   *  x/z are the bug's last known world position — supplied when the cancel came from the client,
+   *  absent when the release was triggered by a disconnect. */
+  receiveBugReleased: (bugN: string, x?: number, z?: number) => void;
+  /**
+   * Full route-state sync sent to newly connected clients.
+   * Teleports the bug to its last known position and recreates all remaining waypoints.
+   */
+  receiveRouteStateSync: (
+    bugN: string,
+    currentX: number,
+    currentY: number,
+    currentZ: number,
+    crewId: string,
+    guid: string,
+    waypoints: Array<{ x: number; y: number; z: number; terminal: boolean }>,
+  ) => void;
+};
+
 export type PlacementFacilityOptions = {
   getPFEnabled: () => boolean;
   onSelectionChange: (info: SelectedObjectInfo) => void;
@@ -158,6 +187,19 @@ export type PlacementFacilityOptions = {
   onRoutingChange?: (isRouting: boolean) => void;
   onDockAtPad?: (params: DockAtPadParams, onAnswer: (loadYes: boolean, acceptYes: boolean) => void) => void;
   onRimWallBlock?: () => void;
+  /** Called when the user clicks a bug — tells App.tsx to send ReserveBug to server.
+   *  x/y/z are the bug's current world position so the server can track it for late-joiners. */
+  onBugReserveRequest?: (bugN: string, x: number, y: number, z: number) => void;
+  /** Called when the routing owner places a waypoint — tells App.tsx to send RequestToPlaceWaypoint. */
+  onWaypointPlaceRequest?: (bugN: string, x: number, y: number, z: number, terminal: boolean) => void;
+  /** Called when the routing owner's bug reaches a waypoint — tells App.tsx to send the clear request. */
+  onWaypointCleared?: (bugN: string, terminal: boolean) => void;
+  /** Called when the routing owner cancels a route (ESC key or RimWall block).
+   *  x/y/z are the bug's current world position so other clients can sync the bug's location. */
+  onRouteCancelled?: (bugN: string, x: number, y: number, z: number) => void;
+  /** This browser tab's GUID — used to distinguish routing owner from observers. */
+  pageGuid?: string;
+  routingApiRef?: { current: RoutingApi | null };
   setPositionRef?: { current: ((x: number, y: number, z: number) => void) | null };
   setRotationRef?: { current: ((rx: number, ry: number, rz: number) => void) | null };
   setScaleRef?: { current: ((sx: number, sy: number, sz: number) => void) | null };
@@ -204,11 +246,24 @@ export class Scene {
       waypoints: THREE.Vector3[];
       waypointTerminalPlaced: boolean;
       waypointCurrentIndex: number;
+      /** True when bug has arrived at its current waypoint and is waiting for server clear. */
+      waypointArrivalPending: boolean;
       selectionCircle: THREE.Group | null;
       waypointMarkersGroup: THREE.Group | null;
       waypointMarkerObjects: THREE.Group[];
     }
   >();
+  /** Who reserved each bug: guid + crewId of the reserving session. */
+  private readonly routingOwners = new Map<string, { guid: string; crewId: string }>();
+  /** Bugs reserved by THIS page's session (owned routing = this client sends clear messages). */
+  private readonly myRoutingBugIds = new Set<string>();
+  /** AST hex colors for routing circles and waypoint markers. */
+  private static readonly AST_COLORS: Record<string, number> = {
+    bowman:  0xff2020,
+    poole:   0xffff00,
+    kimball: 0x2080ff,
+    hal:     0xff8c00,
+  };
   private readonly groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -GROUND_PLANE_Y);
   private mousePosition3D: THREE.Vector3 | null = null;
   private connectingLine: THREE.Line | null = null;
@@ -675,8 +730,13 @@ export class Scene {
   private onKeyDown(event: KeyboardEvent): void {
     const key = event.key.toLowerCase();
     if (key === 'escape' && this.activeRoutingBugId) {
-      this.clearBugWaypointState(this.activeRoutingBugId);
-      this.setActiveRoutingBugId(null);
+      const bugId = this.activeRoutingBugId;
+      const bug = this.buggies.get(bugId);
+      bug?.getWorldPosition(this.tempVec3);
+      this.clearBugWaypointState(bugId);
+      if (bug) {
+        this.pfOptions?.onRouteCancelled?.(bugId, this.tempVec3.x, this.tempVec3.y, this.tempVec3.z);
+      }
       event.preventDefault();
       return;
     }
@@ -1274,11 +1334,11 @@ export class Scene {
     return Math.max(size.x, size.z);
   }
 
-  private createSelectionCircle(radius: number): THREE.Group {
+  private createSelectionCircle(radius: number, color = 0x00ff00): THREE.Group {
     const group = new THREE.Group();
     const ring = new THREE.RingGeometry(radius - 0.03, radius + 0.03, 32);
     const mat = new THREE.MeshBasicMaterial({
-      color: 0x00ff00,
+      color,
       transparent: true,
       opacity: 0.5,
       side: THREE.DoubleSide,
@@ -1290,13 +1350,13 @@ export class Scene {
     return group;
   }
 
-  private createWaypointMarker(bugId: string): THREE.Group {
+  private createWaypointMarker(bugId: string, color = 0x00ff00): THREE.Group {
     const group = new THREE.Group();
     const bug = this.buggies.get(bugId);
     const radius = bug ? this.getBugLength(bug) : 1;
     const ring = new THREE.RingGeometry(radius - 0.03, radius + 0.03, 32);
     const mat = new THREE.MeshBasicMaterial({
-      color: 0x00ff00,
+      color,
       transparent: true,
       opacity: 0.5,
       side: THREE.DoubleSide,
@@ -1306,7 +1366,7 @@ export class Scene {
     mesh.rotation.x = -Math.PI / 2;
     group.add(mesh);
     const sphereGeom = new THREE.SphereGeometry(0.08, 16, 16);
-    const sphereMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+    const sphereMat = new THREE.MeshBasicMaterial({ color });
     const sphere = new THREE.Mesh(sphereGeom, sphereMat);
     sphere.position.y = 0.01;
     group.add(sphere);
@@ -1338,42 +1398,23 @@ export class Scene {
     return this.segRaycaster.intersectObject(this.rimWallMesh, true).length > 0;
   }
 
-  private addWaypoint(position: THREE.Vector3, terminal: boolean): void {
-    const bugId = this.activeRoutingBugId;
-    if (!bugId) return;
+  /** Add a waypoint from a server-broadcast position. RimWall check is done before calling. */
+  private addWaypoint(bugId: string, position: THREE.Vector3, terminal: boolean, color = 0x00ff00): void {
     const state = this.bugRouteStates.get(bugId);
     if (!state) return;
-
-    // Determine the start of this new segment (bug position if first waypoint, else last waypoint).
-    let segFrom: THREE.Vector3;
-    if (state.waypoints.length > 0) {
-      segFrom = state.waypoints[state.waypoints.length - 1];
-    } else {
-      const bug = this.buggies.get(bugId);
-      if (!bug) return;
-      segFrom = new THREE.Vector3();
-      bug.getWorldPosition(segFrom);
-    }
-
-    // Reject the segment if it passes through solid RimWall (tunnels are gaps — no geometry hit).
-    if (this.segmentCrossesRimWall(segFrom, position)) {
-      this.clearBugWaypointState(bugId);
-      this.pfOptions?.onRimWallBlock?.();
-      return;
-    }
 
     state.waypoints.push(position.clone());
     if (terminal) {
       state.waypointTerminalPlaced = true;
       if (state.selectionCircle?.parent) state.selectionCircle.parent.remove(state.selectionCircle);
       state.selectionCircle = null;
-      this.setActiveRoutingBugId(null);
+      if (this.activeRoutingBugId === bugId) this.setActiveRoutingBugId(null);
     }
     if (!state.waypointMarkersGroup) {
       state.waypointMarkersGroup = new THREE.Group();
       this.scene.add(state.waypointMarkersGroup);
     }
-    const marker = this.createWaypointMarker(bugId);
+    const marker = this.createWaypointMarker(bugId, color);
     marker.position.copy(position);
     state.waypointMarkersGroup.add(marker);
     state.waypointMarkerObjects.push(marker);
@@ -1434,28 +1475,34 @@ export class Scene {
   }
 
   private updateBugAlongPath(dt: number): void {
-    const toRemove: string[] = [];
     this.bugRouteStates.forEach((state, bugId) => {
-      if (state.waypoints.length === 0) {
-        if (state.waypointTerminalPlaced) toRemove.push(bugId);
-        return;
-      }
+      if (state.waypoints.length === 0) return;
       const bug = this.buggies.get(bugId);
       if (!bug) return;
-      if (state.waypointCurrentIndex >= state.waypoints.length) {
-        if (state.waypointTerminalPlaced) toRemove.push(bugId);
-        return;
-      }
+      if (state.waypointCurrentIndex >= state.waypoints.length) return;
+
       const target = state.waypoints[state.waypointCurrentIndex];
       bug.getWorldPosition(this.tempVec3);
       const dx = target.x - this.tempVec3.x;
       const dz = target.z - this.tempVec3.z;
       const dist = Math.sqrt(dx * dx + dz * dz) || 0.0001;
+
       if (dist < BUG_WAYPOINT_ARRIVAL) {
-        this.removeWaypointAndMarkerAtIndex(bugId, state.waypointCurrentIndex);
-        if (state.waypoints.length === 0 && state.waypointTerminalPlaced) toRemove.push(bugId);
+        if (!state.waypointArrivalPending) {
+          // Snap bug exactly to the waypoint so it stops cleanly.
+          bug.position.x = target.x;
+          bug.position.z = target.z;
+          state.waypointArrivalPending = true;
+          // Only the routing owner sends the clear request to the server.
+          if (this.myRoutingBugIds.has(bugId)) {
+            const isTerminal = state.waypoints.length === 1 && state.waypointTerminalPlaced;
+            this.pfOptions?.onWaypointCleared?.(bugId, isTerminal);
+          }
+        }
+        // Wait here until receiveClearWaypoint / receiveClearTerminalWaypoint is called.
         return;
       }
+
       const move = Math.min(BUG_WAYPOINT_SPEED * dt, dist);
       const t = move / dist;
       bug.position.x += dx * t;
@@ -1463,7 +1510,6 @@ export class Scene {
       const angle = Math.atan2(dx, dz) + BUG_FORWARD_Y_OFFSET;
       bug.rotation.y = angle;
     });
-    for (const bugId of toRemove) this.clearBugWaypointState(bugId);
   }
 
   private clearBugWaypointState(bugId: string): void {
@@ -1481,6 +1527,8 @@ export class Scene {
     }
     this.bugRouteStates.delete(bugId);
     this.lastFrameNearPadsByBug.delete(bugId);
+    this.routingOwners.delete(bugId);
+    this.myRoutingBugIds.delete(bugId);
     if (this.activeRoutingBugId === bugId) {
       this.setActiveRoutingBugId(null);
       if (this.connectingLine) {
@@ -1489,6 +1537,93 @@ export class Scene {
         (this.connectingLine.material as THREE.Material).dispose();
         this.connectingLine = null;
       }
+    }
+  }
+
+  // ── Route cancellation helpers ────────────────────────────────────────────
+
+  /** Cancel a route that was destroyed by a RimWall crossing attempt. */
+  private cancelRouteForRimWall(bugId: string): void {
+    const bug = this.buggies.get(bugId);
+    bug?.getWorldPosition(this.tempVec3);
+    this.clearBugWaypointState(bugId);
+    this.pfOptions?.onRimWallBlock?.();
+    if (bug) {
+      this.pfOptions?.onRouteCancelled?.(bugId, this.tempVec3.x, this.tempVec3.y, this.tempVec3.z);
+    }
+  }
+
+  // ── Server-coordinated routing receive methods ────────────────────────────
+
+  private receiveRoutingGranted(bugN: string, crewId: string, guid: string): void {
+    this.routingOwners.set(bugN, { guid, crewId });
+    const isOwner = guid === this.pfOptions?.pageGuid;
+    if (isOwner) this.myRoutingBugIds.add(bugN);
+    this.selectBugForWaypoints(bugN, crewId, isOwner);
+  }
+
+  private receiveWaypoint(bugN: string, x: number, _y: number, z: number, terminal: boolean, crewId: string): void {
+    // Ensure routing visuals exist even if RoutingRequestGranted was missed (late-join).
+    if (!this.bugRouteStates.has(bugN)) {
+      const owner = this.routingOwners.get(bugN);
+      this.selectBugForWaypoints(bugN, owner?.crewId ?? crewId, false);
+    }
+    const color = Scene.AST_COLORS[crewId] ?? 0x00ff00;
+    const pos = new THREE.Vector3(x, GROUND_PLANE_Y, z);
+    this.addWaypoint(bugN, pos, terminal, color);
+  }
+
+  private receiveClearWaypoint(bugN: string): void {
+    const state = this.bugRouteStates.get(bugN);
+    if (!state || state.waypoints.length === 0) return;
+    this.removeWaypointAndMarkerAtIndex(bugN, 0);
+    state.waypointArrivalPending = false;
+  }
+
+  private receiveClearTerminalWaypoint(bugN: string): void {
+    this.clearBugWaypointState(bugN);
+  }
+
+  private receiveBugReleased(bugN: string, x?: number, z?: number): void {
+    if (x !== undefined && z !== undefined) {
+      const bug = this.buggies.get(bugN);
+      if (bug) { bug.position.x = x; bug.position.z = z; }
+    }
+    this.clearBugWaypointState(bugN);
+  }
+
+  /**
+   * Sent to newly connected clients so they can reconstruct in-progress routes.
+   * Teleports the bug to its last known position then recreates all remaining waypoints.
+   */
+  private receiveRouteStateSync(
+    bugN: string,
+    currentX: number,
+    _currentY: number,
+    currentZ: number,
+    crewId: string,
+    guid: string,
+    waypoints: Array<{ x: number; y: number; z: number; terminal: boolean }>,
+  ): void {
+    // Record the owner so selectBugForWaypoints can color correctly.
+    this.routingOwners.set(bugN, { guid, crewId });
+    const isOwner = guid === this.pfOptions?.pageGuid;
+    if (isOwner) this.myRoutingBugIds.add(bugN);
+
+    // Teleport the bug to where it currently is.
+    const bug = this.buggies.get(bugN);
+    if (bug) {
+      bug.position.x = currentX;
+      bug.position.z = currentZ;
+    }
+
+    // Set up routing visuals (circle, markers group, connecting line).
+    this.selectBugForWaypoints(bugN, crewId, isOwner);
+
+    // Re-create all remaining waypoints.
+    const color = Scene.AST_COLORS[crewId] ?? 0x00ff00;
+    for (const wp of waypoints) {
+      this.addWaypoint(bugN, new THREE.Vector3(wp.x, GROUND_PLANE_Y, wp.z), wp.terminal, color);
     }
   }
 
@@ -1505,25 +1640,32 @@ export class Scene {
     this.setActiveRoutingBugId(null);
   }
 
-  private selectBugForWaypoints(bugId: string): void {
+  /**
+   * Initialise routing visuals for a bug.
+   * @param crewId  The AST who owns this routing reservation (used for color).
+   * @param isOwner True if this browser tab made the reservation (sets activeRoutingBugId).
+   */
+  private selectBugForWaypoints(bugId: string, crewId = 'bowman', isOwner = false): void {
     const bug = this.buggies.get(bugId);
     if (!bug) return;
+    const color = Scene.AST_COLORS[crewId] ?? 0x00ff00;
     let state = this.bugRouteStates.get(bugId);
     if (!state) {
       state = {
         waypoints: [],
         waypointTerminalPlaced: false,
         waypointCurrentIndex: 0,
+        waypointArrivalPending: false,
         selectionCircle: null,
         waypointMarkersGroup: null,
         waypointMarkerObjects: [],
       };
       this.bugRouteStates.set(bugId, state);
     }
-    this.setActiveRoutingBugId(bugId);
+    if (isOwner) this.setActiveRoutingBugId(bugId);
     const radius = this.getBugLength(bug);
     if (!state.selectionCircle) {
-      state.selectionCircle = this.createSelectionCircle(radius);
+      state.selectionCircle = this.createSelectionCircle(radius, color);
       this.scene.add(state.selectionCircle);
     }
     bug.getWorldPosition(this.tempVec3);
@@ -1535,7 +1677,7 @@ export class Scene {
     if (!this.connectingLine) {
       const lineGeom = new THREE.BufferGeometry();
       const lineMat = new THREE.LineBasicMaterial({
-        color: 0x00ff00,
+        color,
         transparent: true,
         opacity: 0.6,
         depthTest: false,
@@ -1838,36 +1980,76 @@ export class Scene {
       }
     }
 
-    if (event.button === 2) {
-      if (this.activeRoutingBugId) {
-        const pos = this.getGroundIntersection();
-        if (pos) this.addWaypoint(pos, true);
-        event.preventDefault();
-      } else if (bugIdFromRoot) {
-        this.selectBugForWaypoints(bugIdFromRoot);
-        event.preventDefault();
+    // ── Bug click → send ReserveBug to server ──────────────────────────────
+    if (bugIdFromRoot && !this.activeRoutingBugId) {
+      const bugObj = this.buggies.get(bugIdFromRoot);
+      if (bugObj) {
+        const wp = new THREE.Vector3();
+        bugObj.getWorldPosition(wp);
+        this.pfOptions?.onBugReserveRequest?.(bugIdFromRoot, wp.x, wp.y, wp.z);
+      } else {
+        this.pfOptions?.onBugReserveRequest?.(bugIdFromRoot, 0, 0, 0);
       }
+      event.preventDefault();
       return;
     }
 
-    if (event.button === 0) {
-      if (bugIdFromRoot) {
-        this.selectBugForWaypoints(bugIdFromRoot);
+    // ── Routing mode clicks → send waypoint requests to server ─────────────
+    if (this.activeRoutingBugId) {
+      const bugId = this.activeRoutingBugId;
+
+      // If the user clicked on any bug object (could be the routed bug or another bug),
+      // do NOT treat it as a waypoint placement.  Bug reservation happens only when
+      // activeRoutingBugId is null (after the terminal waypoint has been placed).
+      if (bugIdFromRoot !== null) return;
+
+      // Determine the segment start for RimWall check.
+      const state = this.bugRouteStates.get(bugId);
+      let segFrom: THREE.Vector3;
+      if (state && state.waypoints.length > 0) {
+        segFrom = state.waypoints[state.waypoints.length - 1];
+      } else {
+        const bug = this.buggies.get(bugId);
+        if (bug) { segFrom = new THREE.Vector3(); bug.getWorldPosition(segFrom); }
+        else { return; }
+      }
+
+      if (event.button === 2) {
+        const pos = this.getGroundIntersection();
+        if (pos) {
+          if (this.segmentCrossesRimWall(segFrom, pos)) {
+            this.cancelRouteForRimWall(bugId);
+          } else {
+            this.pfOptions?.onWaypointPlaceRequest?.(bugId, pos.x, pos.y, pos.z, true);
+          }
+        }
+        event.preventDefault();
         return;
       }
-      if (this.activeRoutingBugId) {
-        let padHit: THREE.Intersection | null = null;
+
+      if (event.button === 0) {
+        let pos: THREE.Vector3;
+        let terminal: boolean;
         if (this.shinyPathGroup) {
           const mapHits = this.raycaster.intersectObject(this.shinyPathGroup, true);
-          if (mapHits.length > 0 && this.hitIsPad(mapHits[0].object)) padHit = mapHits[0];
-        }
-        if (padHit) {
-          const center = this.getPadCenter(padHit.object);
-          center.y = GROUND_PLANE_Y;
-          this.addWaypoint(center, true);
+          if (mapHits.length > 0 && this.hitIsPad(mapHits[0].object)) {
+            const center = this.getPadCenter(mapHits[0].object);
+            center.y = GROUND_PLANE_Y;
+            pos = center; terminal = true;
+          } else {
+            const gp = this.getGroundIntersection();
+            if (!gp) return;
+            pos = gp; terminal = false;
+          }
         } else {
-          const pos = this.getGroundIntersection();
-          if (pos) this.addWaypoint(pos, false);
+          const gp = this.getGroundIntersection();
+          if (!gp) return;
+          pos = gp; terminal = false;
+        }
+        if (this.segmentCrossesRimWall(segFrom, pos)) {
+          this.cancelRouteForRimWall(bugId);
+        } else {
+          this.pfOptions?.onWaypointPlaceRequest?.(bugId, pos.x, pos.y, pos.z, terminal);
         }
         return;
       }
@@ -2086,6 +2268,16 @@ export class Scene {
         dockAtPad: this.dockAtPad.bind(this),
       };
     }
+    if (this.pfOptions?.routingApiRef) {
+      this.pfOptions.routingApiRef.current = {
+        receiveRoutingGranted:    this.receiveRoutingGranted.bind(this),
+        receiveWaypoint:          this.receiveWaypoint.bind(this),
+        receiveClearWaypoint:     this.receiveClearWaypoint.bind(this),
+        receiveClearTerminalWaypoint: this.receiveClearTerminalWaypoint.bind(this),
+        receiveBugReleased:       this.receiveBugReleased.bind(this),
+        receiveRouteStateSync:    this.receiveRouteStateSync.bind(this),
+      };
+    }
     this.loadAxisHelper();
     this.loadReferenceVehicle();
     this.loadRotationHelper();
@@ -2200,6 +2392,7 @@ export class Scene {
     if (this.pfOptions?.setScaleRef) this.pfOptions.setScaleRef.current = null;
     if (this.pfOptions?.setCameraRef) this.pfOptions.setCameraRef.current = null;
     if (this.pfOptions?.batteryApiRef) this.pfOptions.batteryApiRef.current = null;
+    if (this.pfOptions?.routingApiRef) this.pfOptions.routingApiRef.current = null;
     Array.from(this.racks.keys()).forEach((id) => this.removeBatteryRack(id));
     this.facilityFailureOverlays.forEach((group) => {
       group.traverse((obj) => {
