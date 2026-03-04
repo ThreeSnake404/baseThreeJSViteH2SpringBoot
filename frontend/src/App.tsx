@@ -17,6 +17,52 @@ const API_BASE = '';
 
 const MIN_WINDOW_WIDTH = 1157;
 const MIN_WINDOW_HEIGHT = 587;
+const CARDS_COLUMN_WIDTH = 316;
+const TEXT_PANEL_WIDTH = 278;
+const LOCATION_COOLDOWN_MS = 10 * 60 * 1000;
+
+const LOCATION_DESCRIPTIONS: Array<{ key: string; match: (label: string) => boolean; text: string }> = [
+  {
+    key: 'greenhouse',
+    match: (l) => /green\s*house/i.test(l),
+    text: 'The Green House is a pressurized horticultural module that grows food crops and oxygen-producing plants under artificial lighting. It requires a continuous supply of charged batteries to maintain its climate control systems and grow lights. Without power, temperatures drop rapidly and crops fail within hours.',
+  },
+  {
+    key: 'icemine1',
+    match: (l) => /ice\s*mine\s*1/i.test(l) || /IceMine1/i.test(l),
+    text: 'Ice Mine 1 is the primary water ice extraction facility on the eastern side of the base. Its deep bore drills penetrate several meters into the permanently shadowed regolith to reach ice deposits. The melt and electrolysis systems run continuously, supplying the base with drinking water and propellant feedstock.',
+  },
+  {
+    key: 'icemine2',
+    match: (l) => /ice\s*mine\s*2/i.test(l) || /IceMine2/i.test(l),
+    text: 'Ice Mine 2 is the secondary ice extraction facility on the western approach. It was brought online to meet increasing demand as the base expanded. Its shallower deposits require more lateral drilling but produce a consistent yield. Keeping its battery racks charged is critical to maintaining overall base water reserves.',
+  },
+  {
+    key: 'vehiclebay',
+    match: (l) => /vehicle\s*bay/i.test(l),
+    text: 'The Vehicle Bay is the maintenance and storage facility for all surface transport vehicles, including the bugs. Technicians here perform inspections, replace worn parts, and prepare vehicles for their next mission. It is the hub of all surface operations and the last stop before a bug heads out on a run.',
+  },
+  {
+    key: 'chargingstation',
+    match: (l) => /charging\s*station/i.test(l),
+    text: 'The Charging Station charges drained batteries that are transferred to it. Just bring drained batteries to it with a bug and they will be quickly charged, so you can return them to an empty slot at a location that needs them.',
+  },
+  {
+    key: 'regolith',
+    match: (l) => /^regolith$/i.test(l),
+    text: "WARNING: Regolith is loose, abrasive lunar surface material. Driving on it will significantly reduce your bug's speed and accelerate wheel wear. Prolonged exposure to regolith terrain can degrade traction systems and shorten vehicle service intervals. Stick to paved surfaces wherever possible.",
+  },
+  {
+    key: 'shinyblue',
+    match: (l) => /shiny\s*blue/i.test(l),
+    text: 'ShinyBlue is an advanced surface treatment technology that bonds a smooth, electrostatically charged layer to the lunar ground, repelling fine dust particles and eliminating surface drag. Bug vehicles travelling on ShinyBlue surfaces achieve maximum speed and experience virtually zero wheel wear. All primary transit corridors are paved with ShinyBlue.',
+  },
+  {
+    key: 'rimwall',
+    match: (l) => /rim\s*wall/i.test(l),
+    text: 'DANGER: The Rim Wall is the sheer inner face of the crater that surrounds this base. It cannot be crossed except through one of the three designated tunnels cut into the rock. Attempting to route a bug through the wall at any other point will cause the route to fail. Always plan your paths through a tunnel when crossing the perimeter.',
+  },
+];
 
 type CrewId = 'bowman' | 'poole' | 'kimball' | 'hal';
 
@@ -75,6 +121,35 @@ function App() {
   const [dockParams, setDockParams] = useState<DockAtPadParams | null>(null);
   const [dockLoadYes, setDockLoadYes] = useState<boolean | null>(null);
   const [selectedCrew, setSelectedCrew] = useState<CrewId>('bowman');
+  const [loggedInCrewIds, setLoggedInCrewIds] = useState<CrewId[]>([]);
+  const [messageText, setMessageText] = useState('');
+  const typewriterQueueRef = useRef('Welcome to the Artemis Virtual Training Academy. You have been selected to train with this simulation to become familiar with the Lunar output operations.');
+  const typewriterIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const textScrollRef = useRef<HTMLDivElement>(null);
+
+  const enqueueMessage = useCallback((text: string) => {
+    typewriterQueueRef.current += text;
+  }, []);
+
+  useEffect(() => {
+    // 170 words/minute ≈ 1020 chars/minute = 1 char every 59ms
+    typewriterIntervalRef.current = setInterval(() => {
+      if (typewriterQueueRef.current.length === 0) return;
+      const chunk = typewriterQueueRef.current.slice(0, 1);
+      typewriterQueueRef.current = typewriterQueueRef.current.slice(1);
+      setMessageText((prev) => prev + chunk);
+    }, 59);
+    return () => {
+      if (typewriterIntervalRef.current) clearInterval(typewriterIntervalRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (textScrollRef.current) {
+      textScrollRef.current.scrollTop = textScrollRef.current.scrollHeight;
+    }
+  }, [messageText]);
+
   const [manualOn, setManualOn] = useState(false);
   const [missions, setMissions] = useState<Record<CrewId, number>>({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
   const [cellsDelivered, setCellsDelivered] = useState<Record<CrewId, number>>({ bowman: 0, poole: 0, kimball: 0, hal: 0 });
@@ -131,6 +206,23 @@ function App() {
   useEffect(() => {
     if (typeof window !== 'undefined') window.resizeTo(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT);
   }, []);
+
+  const fetchLoggedInCrew = useCallback(async () => {
+    try {
+      const r = await fetch(`${API_BASE || ''}/api/crew-logins`);
+      if (r.ok) {
+        const ids = (await r.json()) as string[];
+        setLoggedInCrewIds(ids.filter((id): id is CrewId => ['bowman', 'poole', 'kimball', 'hal'].includes(id)));
+      }
+    } catch {
+      setLoggedInCrewIds([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchLoggedInCrew();
+  }, [fetchLoggedInCrew]);
+
   const dockOnAnswerRef = useRef<((loadYes: boolean, acceptYes: boolean) => void) | null>(null);
   pfEnabledRef.current = placementFacilityOn;
 
@@ -173,9 +265,21 @@ function App() {
     }
   }, []);
 
+  const locationLastShownRef = useRef<Map<string, number>>(new Map());
+
   const onHoverInfoChange = useCallback((info: HoverInfo) => {
     setHoverInfo(info);
-  }, []);
+    const label = info?.label ?? null;
+    if (!label) return;
+    const normalized = label.split('\n')[0].trim();
+    const entry = LOCATION_DESCRIPTIONS.find((d) => d.match(normalized));
+    if (!entry) return;
+    const now = Date.now();
+    const lastShown = locationLastShownRef.current.get(entry.key) ?? 0;
+    if (now - lastShown < LOCATION_COOLDOWN_MS) return;
+    locationLastShownRef.current.set(entry.key, now);
+    enqueueMessage('\n\n' + entry.text);
+  }, [enqueueMessage]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const applyZoom = (multiplier: number) => {
     const base = initialCameraDistanceRef.current;
@@ -480,8 +584,286 @@ function App() {
           </div>
         </div>
       )}
-      <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
-      {/* Racks on each pad (hrack/vrack by pad orientation). Batteries represent power per location. */}
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          flexDirection: 'row',
+          overflow: 'hidden',
+          background: '#000',
+        }}
+      >
+        <div
+          style={{
+            width: CARDS_COLUMN_WIDTH,
+            flexShrink: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+            padding: 12,
+            color: '#fff',
+            textShadow: '0 0 4px #000',
+            fontSize: 14,
+            fontFamily: 'Courier, monospace',
+            boxSizing: 'border-box',
+            background: '#000',
+            overflow: 'visible',
+            minHeight: 0,
+          }}
+        >
+          {placementFacilityOn && (
+            <button
+              type="button"
+              onClick={() => setSimulationRunning(true)}
+              disabled={simulationRunning}
+              style={{
+                padding: '4px 10px',
+                fontSize: 12,
+                borderRadius: 4,
+                border: '1px solid #555',
+                background: simulationRunning ? '#333' : '#444',
+                color: '#eee',
+                cursor: simulationRunning ? 'default' : 'pointer',
+              }}
+            >
+              {simulationRunning ? 'Simulation running…' : 'Start simulation'}
+            </button>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {(
+        [
+          { id: 'bowman' as CrewId, src: '/models/RedHelmetBR.png', alt: 'Bowman', label: 'Bowman' },
+          { id: 'poole' as CrewId, src: '/models/YellowHelmetBR.png', alt: 'Poole', label: 'Poole' },
+          { id: 'kimball' as CrewId, src: '/models/BlueHelmetBR.png', alt: 'Kimball', label: 'Kimball' },
+          { id: 'hal' as CrewId, src: '/models/EyeShot.png', alt: 'HAL 9000', label: 'HAL 9000' },
+        ] as const
+      ).map(({ id, src, alt, label }) => {
+        const connected = loggedInCrewIds.includes(id);
+        const selected = selectedCrew === id;
+        return (
+          <div
+            key={id}
+            style={{
+              background: 'rgba(0,0,0,0.6)',
+              border: '1px solid #555',
+              borderRadius: 6,
+              padding: 8,
+              width: '100%',
+              minWidth: CARDS_COLUMN_WIDTH - 24,
+              boxSizing: 'border-box',
+              display: 'flex',
+              flexDirection: 'row',
+              gap: 12,
+              alignItems: 'flex-start',
+              fontFamily: 'Courier, monospace',
+            }}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', flexShrink: 0 }}>
+              <button
+                type="button"
+                onClick={async () => {
+                  setSelectedCrew(id);
+                  try {
+                    await fetch(`${API_BASE || ''}/api/crew-logins`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ crewId: id }),
+                    });
+                    await fetchLoggedInCrew();
+                    enqueueMessage(`\n${label} logged in.`);
+                  } catch {
+                    enqueueMessage(`\n${label} login failed.`);
+                  }
+                }}
+                style={{
+                  padding: 4,
+                  borderRadius: 4,
+                  border: '1px solid #888',
+                  background: selected ? '#666' : '#222',
+                  cursor: 'pointer',
+                }}
+              >
+                <img
+                  src={src}
+                  alt={alt}
+                  style={{ width: 64, height: 64, display: 'block' }}
+                />
+              </button>
+              <span
+                style={{
+                  marginTop: 4,
+                  fontSize: 11,
+                  color: connected ? '#0c0' : '#c00',
+                }}
+              >
+                {connected ? 'Connected' : 'No Signal'}
+              </span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>{label}</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                <span style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap' }}>Number of Missions:</span>
+                <input
+                  type="text"
+                  readOnly
+                  value={missions[id]}
+                  style={{
+                    width: 36,
+                    flexShrink: 0,
+                    padding: '2px 4px',
+                    fontSize: 12,
+                    background: '#222',
+                    color: '#eee',
+                    border: '1px solid #444',
+                    borderRadius: 2,
+                    textAlign: 'right',
+                    fontFamily: 'Courier, monospace',
+                  }}
+                />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                <span style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap' }}>Most Cells Delivered:</span>
+                <input
+                  type="text"
+                  readOnly
+                  value={cellsDelivered[id]}
+                  style={{
+                    width: 36,
+                    flexShrink: 0,
+                    padding: '2px 4px',
+                    fontSize: 12,
+                    background: '#222',
+                    color: '#eee',
+                    border: '1px solid #444',
+                    borderRadius: 2,
+                    textAlign: 'right',
+                    fontFamily: 'Courier, monospace',
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })}
+          </div>
+          <div
+            style={{
+              background: 'rgba(0,0,0,0.6)',
+              border: '1px solid #555',
+              borderRadius: 6,
+              padding: 8,
+              boxSizing: 'border-box',
+              width: '100%',
+            }}
+          >
+            <div style={{ display: 'flex', flexDirection: 'row', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+              {(['high', 'med', 'low'] as const).map((level) => {
+                const label = level === 'high' ? 'High' : level === 'med' ? 'Medium' : 'Low';
+                const onClick =
+                  level === 'high'
+                    ? () => { setZoomLevel('high'); applyZoom(1); }
+                    : level === 'med'
+                    ? () => { setZoomLevel('med'); applyZoom(1 / 2); }
+                    : () => { setZoomLevel('low'); applyZoom(1 / 4); };
+                const active = zoomLevel === level;
+                return (
+                  <button
+                    key={level}
+                    type="button"
+                    onClick={onClick}
+                    style={{
+                      padding: '4px 10px',
+                      fontSize: 12,
+                      borderRadius: 4,
+                      border: '1px solid #555',
+                      background: active ? '#666' : '#444',
+                      color: '#eee',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+              <button
+                type="button"
+                onClick={() => setManualOn((v) => !v)}
+                style={{
+                  padding: '4px 10px',
+                  fontSize: 12,
+                  borderRadius: 4,
+                  border: '1px solid #555',
+                  background: manualOn ? '#666' : '#444',
+                  color: '#eee',
+                  cursor: 'pointer',
+                }}
+              >
+                Manual
+              </button>
+            </div>
+          </div>
+          <div
+            style={{
+              background: 'rgba(0,0,0,0.6)',
+              border: '1px solid #555',
+              borderRadius: 6,
+              padding: 8,
+              boxSizing: 'border-box',
+              width: '100%',
+            }}
+          >
+            <input
+              type="text"
+              value={commandInput}
+              onChange={(e) => setCommandInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleCommandSubmit()}
+              placeholder="Command (e.g. PF=on)"
+              style={{
+                width: '100%',
+                boxSizing: 'border-box',
+                padding: '6px 10px',
+                fontSize: 13,
+                background: '#222',
+                color: '#eee',
+                border: '1px solid #444',
+                borderRadius: 4,
+              }}
+            />
+          </div>
+        </div>
+        <div
+          style={{
+            flex: '1 1 0',
+            minWidth: 0,
+            position: 'relative',
+            overflow: 'hidden',
+            display: 'flex',
+            flexDirection: 'column',
+            zIndex: 0,
+          }}
+          onClick={() => {
+            if (!hoverInfo?.label) return;
+            const normalized = hoverInfo.label.split('\n')[0].trim();
+            const entry = LOCATION_DESCRIPTIONS.find((d) => d.match(normalized));
+            if (!entry) return;
+            locationLastShownRef.current.delete(entry.key);
+            enqueueMessage('\n\n' + entry.text);
+            locationLastShownRef.current.set(entry.key, Date.now());
+          }}
+        >
+          <canvas
+            ref={canvasRef}
+            style={{
+              display: 'block',
+              width: '100%',
+              height: '100%',
+              minHeight: 0,
+              maxWidth: '100%',
+              maxHeight: '100%',
+              objectFit: 'contain',
+            }}
+          />
       {PAD_CONFIG.map((pad) => (
         <BatteryRack
           key={pad.id}
@@ -494,6 +876,14 @@ function App() {
       ))}
       {hoverInfo && (
         <div
+          ref={(el) => {
+            if (!el) return;
+            const canvasRight = window.innerWidth - TEXT_PANEL_WIDTH;
+            const rect = el.getBoundingClientRect();
+            if (rect.right > canvasRight) {
+              el.style.left = `${hoverInfo.screenX - rect.width - 12}px`;
+            }
+          }}
           style={{
             position: 'fixed',
             left: hoverInfo.screenX + 12,
@@ -603,239 +993,96 @@ function App() {
           </div>
         </div>
       )}
-      {placementFacilityOn && (
+      </div>
         <div
           style={{
-            position: 'absolute',
-            top: 60,
-            left: 12,
+            flex: '0 0 auto',
+            width: TEXT_PANEL_WIDTH,
+            position: 'relative',
+            zIndex: 1,
+            background: '#000',
             display: 'flex',
             flexDirection: 'column',
-            gap: 6,
+            padding: 12,
+            boxSizing: 'border-box',
           }}
         >
-          <button
-            type="button"
-            onClick={() => setSimulationRunning(true)}
-            disabled={simulationRunning}
+          <div
             style={{
-              padding: '4px 10px',
-              fontSize: 12,
-              borderRadius: 4,
+              flex: 1,
+              display: 'flex',
+              flexDirection: 'column',
               border: '1px solid #555',
-              background: simulationRunning ? '#333' : '#444',
-              color: '#eee',
-              cursor: simulationRunning ? 'default' : 'pointer',
+              borderRadius: 6,
+              overflow: 'hidden',
+              background: '#000',
             }}
           >
-            {simulationRunning ? 'Simulation running…' : 'Start simulation'}
-          </button>
-        </div>
-      )}
-      <div
-        style={{
-          position: 'absolute',
-          top: 12,
-          left: 12,
-          width: 240,
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 8,
-          color: '#fff',
-          textShadow: '0 0 4px #000',
-          fontSize: 14,
-          fontFamily: 'Courier, monospace',
-          boxSizing: 'border-box',
-        }}
-      >
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 8,
-          }}
-        >
-          {(
-            [
-              { id: 'bowman' as CrewId, src: '/models/RedHelmetBR.png', alt: 'Bowman', label: 'Bowman' },
-              { id: 'poole' as CrewId, src: '/models/YellowHelmetBR.png', alt: 'Poole', label: 'Poole' },
-              { id: 'kimball' as CrewId, src: '/models/BlueHelmetBR.png', alt: 'Kimball', label: 'Kimball' },
-              { id: 'hal' as CrewId, src: '/models/EyeShot.png', alt: 'HAL 9000', label: 'HAL 9000' },
-            ] as const
-          ).map(({ id, src, alt, label }) => {
-            const connected = selectedCrew === id;
-            return (
-              <div
-                key={id}
+            <div
+              ref={textScrollRef}
+              className="terminal-scroll"
+              style={{
+                flex: 1,
+                overflowY: 'auto',
+                padding: 12,
+                fontStyle: 'normal',
+                fontWeight: 'normal',
+                fontFamily: 'Courier, monospace',
+                color: '#00ff00',
+                fontSize: 12,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {messageText.split(/(WARNING|DANGER)/g).map((part, i) =>
+                part === 'WARNING' ? (
+                  <span key={i} style={{ color: '#ff8c00' }}>{part}</span>
+                ) : part === 'DANGER' ? (
+                  <span key={i} style={{ color: '#ff2020' }}>{part}</span>
+                ) : (
+                  part
+                )
+              )}
+            </div>
+            <div style={{ padding: 8, borderTop: '1px solid #555', display: 'flex', flexDirection: 'row', gap: 8, alignItems: 'center' }}>
+              <button
+                type="button"
+                onClick={() => {
+                  typewriterQueueRef.current = '\nDisplay cleared. System ready.';
+                  setMessageText('');
+                }}
                 style={{
-                  background: 'rgba(0,0,0,0.6)',
+                  padding: '6px 12px',
+                  fontSize: 12,
+                  cursor: 'pointer',
+                  background: '#444',
+                  color: '#eee',
                   border: '1px solid #555',
-                  borderRadius: 6,
-                  padding: 8,
-                  minWidth: 240,
-                  display: 'flex',
-                  flexDirection: 'row',
-                  gap: 12,
-                  alignItems: 'flex-start',
+                  borderRadius: 4,
                   fontFamily: 'Courier, monospace',
                 }}
               >
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', flexShrink: 0 }}>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedCrew(id)}
-                    style={{
-                      padding: 4,
-                      borderRadius: 4,
-                      border: '1px solid #888',
-                      background: connected ? '#666' : '#222',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    <img
-                      src={src}
-                      alt={alt}
-                      style={{ width: 64, height: 64, display: 'block' }}
-                    />
-                  </button>
-                  <span
-                    style={{
-                      marginTop: 4,
-                      fontSize: 11,
-                      color: connected ? '#0c0' : '#c00',
-                    }}
-                  >
-                    {connected ? 'Connected' : 'No Signal'}
-                  </span>
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600 }}>{label}</div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-                    <span style={{ flex: 1, minWidth: 0 }}>Number of Missions:</span>
-                    <input
-                      type="text"
-                      readOnly
-                      value={missions[id]}
-                      style={{
-                        width: 36,
-                        flexShrink: 0,
-                        padding: '2px 4px',
-                        fontSize: 12,
-                        background: '#222',
-                        color: '#eee',
-                        border: '1px solid #444',
-                        borderRadius: 2,
-                        textAlign: 'right',
-                        fontFamily: 'Courier, monospace',
-                      }}
-                    />
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-                    <span style={{ flex: 1, minWidth: 0 }}>Most Cells Delivered:</span>
-                    <input
-                      type="text"
-                      readOnly
-                      value={cellsDelivered[id]}
-                      style={{
-                        width: 36,
-                        flexShrink: 0,
-                        padding: '2px 4px',
-                        fontSize: 12,
-                        background: '#222',
-                        color: '#eee',
-                        border: '1px solid #444',
-                        borderRadius: 2,
-                        textAlign: 'right',
-                        fontFamily: 'Courier, monospace',
-                      }}
-                    />
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        <div
-          style={{
-            background: 'rgba(0,0,0,0.6)',
-            border: '1px solid #555',
-            borderRadius: 6,
-            padding: 8,
-            boxSizing: 'border-box',
-          }}
-        >
-          <div style={{ display: 'flex', flexDirection: 'row', gap: 6, alignItems: 'center' }}>
-            {(['high', 'med', 'low'] as const).map((level) => {
-              const label = level === 'high' ? 'High' : level === 'med' ? 'Med' : 'Low';
-              const onClick =
-                level === 'high'
-                  ? () => { setZoomLevel('high'); applyZoom(1); }
-                  : level === 'med'
-                  ? () => { setZoomLevel('med'); applyZoom(1 / 2); }
-                  : () => { setZoomLevel('low'); applyZoom(1 / 4); };
-              const active = zoomLevel === level;
-              return (
-                <button
-                  key={level}
-                  type="button"
-                  onClick={onClick}
-                  style={{
-                    padding: '4px 10px',
-                    fontSize: 12,
-                    borderRadius: 4,
-                    border: '1px solid #555',
-                    background: active ? '#666' : '#444',
-                    color: '#eee',
-                    cursor: 'pointer',
-                  }}
-                >
-                  {label}
-                </button>
-              );
-            })}
-            <button
-              type="button"
-              onClick={() => setManualOn((v) => !v)}
-              style={{
-                padding: '4px 10px',
-                fontSize: 12,
-                borderRadius: 4,
-                border: '1px solid #555',
-                background: manualOn ? '#666' : '#444',
-                color: '#eee',
-                cursor: 'pointer',
-              }}
-            >
-              Manual
-            </button>
+                Clear
+              </button>
+              <button
+                type="button"
+                onClick={openH2Console}
+                title="Open H2 console (JDBC URL: jdbc:h2:file:./data/pocdb, User: sa, Password: empty)"
+                style={{
+                  padding: '6px 12px',
+                  fontSize: 12,
+                  cursor: 'pointer',
+                  border: '1px solid #555',
+                  borderRadius: 4,
+                  background: '#444',
+                  color: '#eee',
+                  fontFamily: 'Courier, monospace',
+                }}
+              >
+                DB
+              </button>
+            </div>
           </div>
-        </div>
-        <div
-          style={{
-            background: 'rgba(0,0,0,0.6)',
-            border: '1px solid #555',
-            borderRadius: 6,
-            padding: 8,
-            boxSizing: 'border-box',
-          }}
-        >
-          <input
-            type="text"
-            value={commandInput}
-            onChange={(e) => setCommandInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleCommandSubmit()}
-            placeholder="Command (e.g. PF=on)"
-            style={{
-              width: '100%',
-              boxSizing: 'border-box',
-              padding: '6px 10px',
-              fontSize: 13,
-              background: '#222',
-              color: '#eee',
-              border: '1px solid #444',
-              borderRadius: 4,
-            }}
-          />
         </div>
       </div>
       {placementFacilityOn && (
@@ -1027,27 +1274,6 @@ function App() {
           </div>
         </div>
       )}
-      <button
-        type="button"
-        onClick={openH2Console}
-        title="Open H2 console (JDBC URL: jdbc:h2:file:./data/pocdb, User: sa, Password: empty)"
-        style={{
-          position: 'absolute',
-          bottom: 16,
-          right: 16,
-          padding: '8px 14px',
-          fontSize: 14,
-          fontWeight: 600,
-          cursor: 'pointer',
-          border: '1px solid #444',
-          borderRadius: 6,
-          background: '#2a2a2a',
-          color: '#eee',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
-        }}
-      >
-        DB
-      </button>
     </>
   );
 }
